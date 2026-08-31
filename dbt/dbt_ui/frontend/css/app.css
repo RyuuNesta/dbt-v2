@@ -1242,3 +1242,331 @@ table.data.compact th, table.data.compact td { padding: 5px 9px; }
 
 /* Toggles sit inline with the search box and sort control. */
 .pick-table + p { margin-top: 9px; }
+
+
+/* --------------------------------------------------------------------------
+   Cleanup Advisor: batch progress, and the transparency preview.
+
+   The advisor now analyses a set of tables rather than one, so it needs a
+   determinate progress meter (an indeterminate spinner is the wrong signal
+   when the wait is proportional to a number the user chose) and a way to show
+   one table's detail underneath the batch summary.
+   -------------------------------------------------------------------------- */
+
+.meter {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  border: 1px solid var(--line-soft);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--accent-solid);
+  /* Width is the only animated property, so this cannot cause layout thrash. */
+  transition: width var(--motion) linear;
+}
+
+.batch-progress .panel-body { padding-top: var(--s4); }
+
+/* Marks a per-table detail block that is nested under a batch summary, so it
+   is obvious the panel below belongs to the row that was just clicked. */
+.deep-dive-mark {
+  margin: var(--s5) 0 var(--s2);
+  padding-left: var(--s2);
+  border-left: 3px solid var(--accent-line);
+}
+
+/* Shown when the accepted recommendations change and a derived tab is stale.
+   Saying so beats silently serving a plan that no longer matches the ticks. */
+.stale-note {
+  padding: var(--s5);
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+}
+
+table.data tbody tr.is-failed td { opacity: 0.62; }
+table.data tbody tr.is-failed td:first-child { border-left: 2px solid var(--err); }
+
+/* ---------------------------------------------------- transparency plan --- */
+
+.plan-source {
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  margin-bottom: var(--s2);
+}
+
+.plan-steps {
+  margin: 0;
+  padding: 0 0 0 var(--s5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+
+.plan-step {
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-raise);
+}
+
+/* Colour-coded by what the step does to the data, not by severity: anything
+   that removes rows or changes a type deserves a second look, and the border
+   is what makes those two findable in a list of nine. */
+.plan-step[data-kind="read"]          { border-left-color: var(--line-strong); }
+.plan-step[data-kind="deduplicate"]   { border-left-color: var(--err); }
+.plan-step[data-kind="prune"]         { border-left-color: var(--warn); }
+.plan-step[data-kind="type_cast"]     { border-left-color: var(--warn); }
+.plan-step[data-kind="null_handling"] { border-left-color: var(--info); }
+.plan-step[data-kind="standardise"]   { border-left-color: var(--info); }
+.plan-step[data-kind="derive_period"] { border-left-color: var(--ok); }
+.plan-step[data-kind="categorise"]    { border-left-color: var(--ok); }
+.plan-step[data-kind="split_sign"]    { border-left-color: var(--ok); }
+.plan-step[data-kind="quality_flag"]  { border-left-color: var(--accent-line); }
+.plan-step[data-kind="audit"]         { border-left-color: var(--source); }
+
+.plan-step-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 3px;
+}
+
+.plan-step-detail {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+
+.plan-step-evidence {
+  margin-top: var(--s2);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-style: italic;
+  line-height: 1.5;
+}
+
+.plan-step-sql {
+  display: block;
+  margin-top: var(--s2);
+  padding: var(--s2) var(--s3);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--code-fg);
+  background: var(--console-bg);
+  border-radius: 5px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.plan-test {
+  padding: var(--s2) var(--s3);
+  border-top: 1px solid var(--line-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s3);
+  align-items: baseline;
+}
+
+.plan-test:first-of-type { border-top: 0; }
+.plan-test > .tiny { flex-basis: 100%; }
+
+/* Where each output column came from. A reviewer's first question about a
+   generated schema is "did this appear out of nowhere", so origin is a
+   first-class column rather than something buried in a note. */
+.chip.origin-key        { background: var(--accent-soft); color: var(--accent); }
+.chip.origin-passthrough{ background: var(--bg-hover);    color: var(--text-faint); }
+.chip.origin-cleaned    { background: var(--info-soft);   color: var(--info); }
+.chip.origin-recast     { background: var(--warn-soft);   color: var(--warn); }
+.chip.origin-derived    { background: var(--ok-soft);     color: var(--ok); }
+.chip.origin-flag       { background: var(--accent-soft); color: var(--accent); }
+.chip.origin-macro      { background: var(--bg-hover);    color: var(--source); }
+
+.chip.faint { background: var(--bg-hover); color: var(--text-faint); }
+
+/* Editable generated SQL. Monospace and tall, because it is a model file, not
+   a form field. */
+.code-area {
+  width: 100%;
+  min-height: 340px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 4;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+  resize: vertical;
+}
+
+
+/* --------------------------------------------------------------------------
+   ERD (Entity Relationship Diagram).
+
+   A hand-rolled SVG canvas, same medallion palette as the lineage graph. The
+   layout differs from every other page here: canvas + side panel side by side,
+   filling the available height, because a diagram wants room, not a scrolling
+   column of panels.
+   -------------------------------------------------------------------------- */
+
+.erd-page { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+
+.erd-help .panel-body { padding: var(--s3) var(--s4); }
+
+.erd-toolbar {
+  padding: var(--s3) var(--s4);
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-top: var(--s3);
+}
+
+.erd-legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s4);
+  padding: var(--s2) var(--s1);
+  font-size: 11.5px; color: var(--text-faint);
+}
+.erd-legend-item { display: inline-flex; align-items: center; gap: 5px; text-transform: capitalize; }
+.erd-legend-sep { opacity: 0.5; }
+.erd-legend-swatch {
+  width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none;
+}
+.erd-line-sample {
+  width: 22px; height: 0; border-top: 2px solid var(--text-faint); display: inline-block;
+}
+.erd-line-sample.dashed { border-top-style: dashed; }
+
+.erd-status {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 0 var(--s1) var(--s2);
+}
+
+.erd-layout {
+  flex: 1;
+  min-height: 480px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: var(--s4);
+}
+@media (max-width: 1050px) {
+  .erd-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+.erd-canvas {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    radial-gradient(circle, var(--line-soft) 1px, transparent 1px) 0 0 / 22px 22px,
+    var(--bg-input);
+  overflow: hidden;
+  cursor: grab;
+  min-height: 420px;
+}
+.erd-canvas:focus-visible { outline: 2px solid var(--accent-line); outline-offset: -2px; }
+.erd-canvas.is-panning { cursor: grabbing; }
+.erd-svg { display: block; user-select: none; }
+
+.erd-side {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  padding: var(--s4);
+  overflow: auto;
+}
+.erd-side-empty { padding: var(--s6) var(--s3); text-align: center; }
+.erd-side-head {
+  display: flex; align-items: center; gap: var(--s2);
+  margin-bottom: var(--s3);
+}
+.erd-side-head h3 { flex: 1; margin: 0; font-size: 14px; }
+
+.erd-rel-row {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  padding: 5px 0; border-top: 1px solid var(--line-soft);
+}
+.erd-rel-row:first-of-type { border-top: 0; }
+
+/* ---------------------------------------------------------------- nodes --- */
+
+.erd-node { cursor: grab; }
+.erd-node:active { cursor: grabbing; }
+
+.erd-node-box {
+  fill: var(--bg-raise);
+  stroke: var(--line-strong);
+  stroke-width: 1;
+  filter: drop-shadow(0 2px 5px rgba(0,0,0,0.35));
+}
+.erd-node.is-selected .erd-node-box { stroke: var(--accent); stroke-width: 2; }
+.erd-node.is-dimmed { opacity: 0.32; }
+.erd-node.is-dimmed:hover { opacity: 0.7; }
+
+.erd-node-title { font: 600 12px var(--sans); fill: var(--ln-label); }
+.erd-node-badge { font: 9px var(--sans); fill: var(--ln-label); opacity: 0.8; }
+
+.erd-col-row { cursor: default; }
+.erd-col-hit { fill: var(--warn-soft); }
+.erd-col-marker { font: 10px var(--sans); }
+.erd-col-name { font: 11px var(--mono); fill: var(--text-dim); }
+.erd-col-name.is-pk { fill: var(--text); font-weight: 700; }
+.erd-col-type { font: 10px var(--mono); fill: var(--text-faint); }
+.erd-col-more { font: 10px var(--mono); fill: var(--text-faint); font-style: italic; }
+
+/* -------------------------------------------------------------- edges --- */
+
+.erd-edge-path { fill: none; stroke: var(--ln-edge); stroke-width: 1.5; }
+.erd-edge-label {
+  font: 10px var(--mono); fill: var(--text-faint);
+  paint-order: stroke; stroke: var(--bg-input); stroke-width: 3px;
+}
+
+.erd-edge-declared .erd-edge-path,
+.erd-edge-lineage .erd-edge-path   { stroke: var(--ln-edge); }
+.erd-edge-inferred .erd-edge-path  { stroke: var(--text-faint); }
+.erd-edge-constraint .erd-edge-path { stroke: var(--ok); }
+
+.erd-edge.is-hover .erd-edge-path,
+.erd-edge.is-hot .erd-edge-path {
+  stroke: var(--accent); stroke-width: 2.4;
+}
+.erd-edge.is-hover .erd-edge-label,
+.erd-edge.is-hot .erd-edge-label { fill: var(--accent); }
+.erd-edge.is-dimmed .erd-edge-path { opacity: 0.15; }
+.erd-edge.is-dimmed .erd-edge-label { opacity: 0.15; }
+
+.erd-export-menu { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* ------------------------------------------------------------- printing --- */
+
+/* PDF export is window.print() scoped to the diagram: everything else in the
+   app is hidden for the duration of the print, and the canvas is allowed to
+   grow to its full content size rather than being clipped to the viewport. */
+@media print {
+  body.erd-printing .sidebar,
+  body.erd-printing .topbar,
+  body.erd-printing .erd-toolbar,
+  body.erd-printing .erd-help,
+  body.erd-printing .erd-status,
+  body.erd-printing .erd-side,
+  body.erd-printing .run-dock,
+  body.erd-printing .toasts {
+    display: none !important;
+  }
+  body.erd-printing .content { padding: 0; overflow: visible; }
+  body.erd-printing .erd-layout { grid-template-columns: 1fr; height: auto; }
+  body.erd-printing .erd-canvas {
+    border: none;
+    background: #ffffff;
+    height: auto;
+    overflow: visible;
+  }
+  body.erd-printing .erd-svg { width: 100%; height: auto; }
+}

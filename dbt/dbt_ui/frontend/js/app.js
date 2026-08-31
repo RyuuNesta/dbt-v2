@@ -17,11 +17,12 @@ import * as schema from './views/schema.js';
 import * as advisor from './views/advisor.js';
 import * as runs from './views/runs.js';
 import * as catalog from './views/catalog.js';
+import * as erd from './views/erd.js';
 import * as schedule from './views/schedule.js';
 
-const VIEWS = { overview, pipeline, workbench, schema, advisor, runs, catalog, schedule };
+const VIEWS = { overview, pipeline, workbench, schema, advisor, runs, catalog, erd, schedule };
 const ORDER = ['overview', 'pipeline', 'workbench', 'schema', 'advisor', 'runs',
-               'catalog', 'schedule'];
+               'catalog', 'erd', 'schedule'];
 
 let current = 'overview';
 

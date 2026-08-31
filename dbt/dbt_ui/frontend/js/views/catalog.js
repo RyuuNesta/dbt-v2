@@ -187,7 +187,9 @@ async function loadGraph(view) {
     el('div.lineage', drawGraph(graph))));
 }
 
-const LAYER_COLOURS = {
+/* Exported so the ERD view (Feature 8) draws tables in the same palette as
+   this lineage graph, rather than inventing a second one that could drift. */
+export const LAYER_COLOURS = {
   source: '#6f7d8f',
   seed: '#7c8b9d',
   bronze: '#c8813c',

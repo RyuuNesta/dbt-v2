@@ -18,6 +18,7 @@ from . import (
     ai_docs,
     codegen,
     config,
+    erd as erd_mod,
     jinja_sql,
     manifest as manifest_mod,
     modelgen,
@@ -275,6 +276,76 @@ def _sources(request: Request) -> Tuple[int, Any]:
 @ROUTER.get("/api/graph")
 def _graph(request: Request) -> Tuple[int, Any]:
     return 200, _manifest().graph()
+
+
+def _erd_options(request: Request) -> Dict[str, Any]:
+    """Shared query parsing, so the diagram and its exports cannot disagree."""
+    tables = request.q("tables")
+    datasets = request.q("datasets")
+    return {
+        "target": request.q("target"),
+        # Gold is shown by default, dimmed, exactly like the lineage graph and
+        # the Pipeline board. in_scope_only is the export-time opt-in for a
+        # deliberately bronze/silver-only diagram.
+        "in_scope_only": request.q_bool("in_scope_only", False),
+        "include_staging": request.q_bool("include_staging", True),
+        "include_sources": request.q_bool("include_sources", True),
+        "only_tables": [t for t in (tables or "").split(",") if t.strip()],
+        "datasets": [d for d in (datasets or "").split(",") if d.strip()],
+        # Both cost a query, so neither happens unless asked for.
+        "with_counts": request.q_bool("counts", False),
+        "with_constraints": request.q_bool("constraints", False),
+    }
+
+
+@ROUTER.get("/api/erd")
+def _erd(request: Request) -> Tuple[int, Any]:
+    """
+    Entity relationship model derived from the manifest.
+
+    Manifest-only by default: no warehouse call, so this works with expired
+    credentials and costs nothing.
+    """
+    options = _erd_options(request)
+    target = options.pop("target")
+    return 200, erd_mod.build(_manifest(), target, **options)
+
+
+@ROUTER.get("/api/erd/export")
+def _erd_export(request: Request) -> Tuple[int, Any]:
+    """
+    Text exports of the diagram: Mermaid or DBML.
+
+    Rebuilt from the same erd.build() the diagram uses rather than accepting a
+    payload from the browser, so an export can never describe a diagram the
+    project does not actually have. SVG, PNG and PDF are produced in the browser
+    from the live DOM - they have no server-side equivalent.
+    """
+    fmt = (request.q("format") or "mermaid").lower()
+    if fmt not in ("mermaid", "dbml"):
+        raise ApiError(
+            f"Unsupported export format '{fmt}'. Use 'mermaid' or 'dbml'.",
+            400,
+        )
+
+    options = _erd_options(request)
+    target = options.pop("target")
+    model = erd_mod.build(_manifest(), target, **options)
+
+    if fmt == "mermaid":
+        content = erd_mod.to_mermaid(model, keys_only=request.q_bool("keys_only", False))
+        filename = "erd.mmd"
+    else:
+        content = erd_mod.to_dbml(model)
+        filename = "erd.dbml"
+
+    return 200, {
+        "format": fmt,
+        "filename": filename,
+        "content": content,
+        "table_count": model["stats"]["table_count"],
+        "relationship_count": model["stats"]["relationship_count"],
+    }
 
 
 @ROUTER.get("/api/refs")
@@ -853,13 +924,16 @@ def _advisor_analyse(request: Request) -> Tuple[int, Any]:
     return 200, analysis
 
 
-@ROUTER.post("/api/advisor/generate")
-def _advisor_generate(request: Request) -> Tuple[int, Any]:
-    """Turn the accepted recommendations into a silver model."""
+def _advisor_context(request: Request) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """
+    Re-profile a source model and rebuild its analysis.
+
+    Shared by the preview and the generator so the two can never disagree about
+    what the recommendations are. Both re-measure rather than trusting a payload
+    posted back by the browser: the accepted *ids* come from the client, the
+    facts behind them do not.
+    """
     source_model = str(request.need("model"))
-    accepted = request.opt("accepted_ids")
-    model_name = str(request.opt("model_name", ""))
-    materialized = str(request.opt("materialized", "view"))
 
     mf = _manifest()
     node = mf.node_detail(source_model)
@@ -891,13 +965,43 @@ def _advisor_generate(request: Request) -> Tuple[int, Any]:
             duplicate = None
 
     analysis = recommend.analyse(profile, duplicate)
+    # silver_plan reads the duplicate check to estimate the output row count,
+    # and analyse() does not put it on the result.
+    analysis["duplicate_check"] = duplicate
+    return source_model, analysis, profile
+
+
+@ROUTER.post("/api/advisor/preview")
+def _advisor_preview(request: Request) -> Tuple[int, Any]:
+    """
+    Explain how the silver model would be built, without building it.
+
+    Nothing here writes, and nothing here queries the warehouse beyond the
+    profile the analysis needs anyway.
+    """
+    source_model, analysis, profile = _advisor_context(request)
+    plan = codegen.silver_plan(
+        source_model=source_model,
+        analysis=analysis,
+        profile=profile,
+        accepted_ids=request.opt("accepted_ids"),
+        model_name=str(request.opt("model_name", "")),
+        materialized=str(request.opt("materialized", "view")),
+    )
+    return 200, plan
+
+
+@ROUTER.post("/api/advisor/generate")
+def _advisor_generate(request: Request) -> Tuple[int, Any]:
+    """Turn the accepted recommendations into a silver model."""
+    source_model, analysis, profile = _advisor_context(request)
     generated = codegen.silver_model(
         source_model=source_model,
         analysis=analysis,
         profile=profile,
-        accepted_ids=accepted,
-        model_name=model_name,
-        materialized=materialized,
+        accepted_ids=request.opt("accepted_ids"),
+        model_name=str(request.opt("model_name", "")),
+        materialized=str(request.opt("materialized", "view")),
     )
     return 200, generated
 

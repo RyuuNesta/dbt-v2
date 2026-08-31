@@ -108,6 +108,36 @@ export const api = {
       query: { dataset, target: state.target, refresh: refresh ? '1' : '' },
     }),
 
+  /* Entity relationship model, derived from the manifest. Manifest-only by
+     default - counts and BigQuery-declared constraints are both opt-in because
+     each costs a query. */
+  erd: (options = {}) =>
+    request('GET', '/api/erd', {
+      query: {
+        target: state.target,
+        in_scope_only: options.inScopeOnly ? '1' : '',
+        include_staging: options.includeStaging === false ? '0' : '',
+        include_sources: options.includeSources === false ? '0' : '',
+        tables: (options.tables || []).join(','),
+        datasets: (options.datasets || []).join(','),
+        counts: options.counts ? '1' : '',
+        constraints: options.constraints ? '1' : '',
+      },
+    }),
+  erdExport: (format, options = {}) =>
+    request('GET', '/api/erd/export', {
+      query: {
+        format,
+        target: state.target,
+        in_scope_only: options.inScopeOnly ? '1' : '',
+        include_staging: options.includeStaging === false ? '0' : '',
+        include_sources: options.includeSources === false ? '0' : '',
+        tables: (options.tables || []).join(','),
+        datasets: (options.datasets || []).join(','),
+        keys_only: options.keysOnly ? '1' : '',
+      },
+    }),
+
   compile: (sql) => request('POST', '/api/query/compile', { body: withTarget({ sql }) }),
   validate: (sql) => request('POST', '/api/query/validate', { body: withTarget({ sql }) }),
   run: (sql, limit) => request('POST', '/api/query/run', { body: withTarget({ sql, limit }) }),
@@ -129,6 +159,9 @@ export const api = {
   clearAiKey: () => request('POST', '/api/ai/key', { body: { action: 'clear' } }),
   profile: (body) => request('POST', '/api/profile', { body: withTarget(body) }),
   analyse: (body) => request('POST', '/api/advisor/analyse', { body: withTarget(body) }),
+  /* Explains the transformation before it is generated. Writes nothing and
+     compiles nothing - the estimate comes from the profile already taken. */
+  previewSilver: (body) => request('POST', '/api/advisor/preview', { body: withTarget(body) }),
   generateSilver: (body) => request('POST', '/api/advisor/generate', { body: withTarget(body) }),
 
   datasets: () => request('GET', '/api/warehouse/datasets', { query: { target: state.target } }),

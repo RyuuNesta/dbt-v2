@@ -561,24 +561,15 @@ def _build_select(
     dropped: set,
 ) -> List[str]:
     """Assemble the SELECT list, applying the accepted transformations."""
-    trims = {c for rec in by_category.get("standardisation", [])
-             for c in rec["columns"] if "trim" in rec["sql_hint"]}
-    uppers = {c for rec in by_category.get("standardisation", [])
-              for c in rec["columns"] if "upper" in rec["sql_hint"]}
-    blanks = {c for rec in by_category.get("null_handling", [])
-              for c in rec["columns"] if "nullif" in rec["sql_hint"]}
-    casts = {c for rec in by_category.get("type_cast", [])
-             for c in rec["columns"]}
-    flags = {c for rec in by_category.get("quality_flag", [])
-             for c in rec["columns"]}
-    splits = {c for rec in by_category.get("categorisation", [])
-              for c in rec["columns"]
-              if "abs(" in rec["sql_hint"]}
-    labels = {c for rec in by_category.get("categorisation", [])
-              for c in rec["columns"]
-              if rec["sql_hint"].startswith("case ")}
-    periods = {c for rec in by_category.get("partitioning", [])
-               for c in rec["columns"]}
+    sets = _transform_sets(by_category)
+    trims = sets["trims"]
+    uppers = sets["uppers"]
+    blanks = sets["blanks"]
+    casts = sets["casts"]
+    flags = sets["flags"]
+    splits = sets["splits"]
+    labels = sets["labels"]
+    periods = sets["periods"]
 
     lines: List[str] = []
     audit_lines: List[str] = []
@@ -669,3 +660,439 @@ def _build_select(
     lines.append("{{ asg_audit_columns('silver') }}")
 
     return lines
+
+
+# --------------------------------------------------------------------------
+# transformation plan (the transparency preview)
+# --------------------------------------------------------------------------
+#
+# silver_plan() answers "what is about to happen, and why" before a line of SQL
+# is generated. It is deliberately derived from the same _transform_sets() the
+# generator uses, so the preview cannot describe one thing while the SQL does
+# another. If a category is added to _build_select and not here, the plan is
+# incomplete rather than wrong - and the column walk below will still show the
+# passthrough, because it starts from the profile rather than from the SQL.
+
+# Columns the asg_audit_columns('silver') macro appends. Hardcoded because the
+# macro is Jinja that only dbt can expand, and the UI must not pretend to
+# compile it. Kept beside the macro's definition in macros/asg_helpers.sql.
+AUDIT_MACRO_COLUMNS = [
+    ("_silver_loaded_at", "timestamp", "current_timestamp()"),
+    ("_dbt_invocation_id", "string", "the dbt run that produced the row"),
+    ("_dbt_target", "string", "the target the run used"),
+]
+
+
+def _transform_sets(by_category: Dict[str, List[Dict[str, Any]]]) -> Dict[str, set]:
+    """
+    Which columns each transformation applies to, keyed by transformation.
+
+    Read off the accepted recommendations' sql_hint rather than the category
+    alone, because one category can carry two different treatments:
+    standardisation covers both `trim(x)` and `upper(trim(x))`, and
+    categorisation covers both a `case` label and an `abs()` sign split.
+    """
+    def columns_where(category: str, predicate) -> set:
+        return {
+            column
+            for rec in by_category.get(category, [])
+            for column in rec["columns"]
+            if predicate(rec["sql_hint"])
+        }
+
+    return {
+        "trims": columns_where("standardisation", lambda hint: "trim" in hint),
+        "uppers": columns_where("standardisation", lambda hint: "upper" in hint),
+        "blanks": columns_where("null_handling", lambda hint: "nullif" in hint),
+        "casts": columns_where("type_cast", lambda _: True),
+        "flags": columns_where("quality_flag", lambda _: True),
+        "splits": columns_where("categorisation", lambda hint: "abs(" in hint),
+        "labels": columns_where("categorisation",
+                                lambda hint: hint.startswith("case ")),
+        "periods": columns_where("partitioning", lambda _: True),
+    }
+
+
+def _step(kind: str, title: str, detail: str,
+          columns: Optional[List[str]] = None,
+          evidence: str = "", sql: str = "") -> Dict[str, Any]:
+    return {
+        "kind": kind,
+        "title": title,
+        "detail": detail,
+        "columns": sorted(columns or []),
+        "evidence": evidence,
+        "sql": sql,
+    }
+
+
+def silver_plan(
+    source_model: str,
+    analysis: Dict[str, Any],
+    profile: Dict[str, Any],
+    accepted_ids: Optional[Sequence[str]] = None,
+    model_name: str = "",
+    materialized: str = "view",
+) -> Dict[str, Any]:
+    """
+    Explain how the silver model would be built, without building it.
+
+    Returns the source relations, the ordered transformation steps, the column
+    schema that would result, and an estimated row count. Nothing here queries
+    the warehouse: every number comes from the profile and duplicate check that
+    have already been paid for.
+    """
+    accepted = _applied(analysis.get("recommendations") or [], accepted_ids)
+    by_category: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in accepted:
+        by_category.setdefault(rec["category"], []).append(rec)
+
+    columns = {c["name"]: c for c in (profile.get("columns") or [])}
+    plan_meta = analysis.get("plan") or {}
+    key_columns = [c for c in (plan_meta.get("key_columns") or []) if c in columns]
+
+    sets = _transform_sets(by_category)
+    dropped = {
+        column for rec in by_category.get("pruning", []) for column in rec["columns"]
+    }
+
+    target_name = model_name or _silver_name(source_model)
+
+    # ---------------- sources ----------------
+
+    sources = [{
+        "model": source_model,
+        "relation": profile.get("relation"),
+        "row_count": profile.get("declared_row_count") or profile.get("row_count"),
+        "reference": f"{{{{ ref('{source_model}') }}}}",
+        "note": "Resolved by dbt at build time, so the same SQL works on every "
+                "target.",
+    }]
+
+    # ---------------- steps, in the order the SQL applies them ----------------
+
+    steps: List[Dict[str, Any]] = [
+        _step(
+            "read",
+            f"Read every row of {source_model}",
+            "The model opens with an unfiltered read. Bronze is the faithful "
+            "copy, so nothing is excluded here.",
+            sql=f"select * from {{{{ ref('{source_model}') }}}}",
+        ),
+    ]
+
+    dedup_recs = [
+        rec for rec in by_category.get("deduplication", [])
+        if rec["sql_hint"].startswith("row_number")
+    ]
+    order_column = _recency_column(columns)
+    duplicate = analysis.get("duplicate_check") or {}
+
+    if dedup_recs and key_columns:
+        steps.append(_step(
+            "deduplicate",
+            f"Keep one row per {', '.join(key_columns)}",
+            f"Ranks rows within each key by {order_column} descending and keeps "
+            "the newest. Rows are removed here, and only here.",
+            key_columns,
+            dedup_recs[0]["evidence"],
+            f"row_number() over (partition by {', '.join(key_columns)} "
+            f"order by {order_column} desc) = 1",
+        ))
+
+    if dropped:
+        steps.append(_step(
+            "prune",
+            f"Omit {len(dropped)} column(s) that carry no information",
+            "Constant or entirely null in the profile. They stay in bronze for "
+            "fidelity and are simply not selected forward.",
+            list(dropped),
+            "; ".join(
+                rec["evidence"] for rec in by_category.get("pruning", [])
+            ),
+        ))
+
+    if sets["blanks"]:
+        steps.append(_step(
+            "null_handling",
+            "Normalise empty strings to null",
+            "An empty string and a NULL behave differently in comparisons and "
+            "aggregates. Collapsing them here means downstream only has one "
+            "case to handle.",
+            list(sets["blanks"]),
+            "; ".join(rec["evidence"] for rec in by_category.get("null_handling", [])),
+            "nullif(trim(<column>), '')",
+        ))
+
+    standardised = sets["uppers"] | (sets["trims"] - sets["uppers"] - sets["blanks"])
+    if standardised:
+        steps.append(_step(
+            "standardise",
+            "Trim and case-fold codes",
+            "Codes that are joined or compared on are normalised once here, so "
+            "no downstream model has to remember to do it.",
+            list(standardised),
+            "; ".join(rec["evidence"] for rec in by_category.get("standardisation", [])),
+            "upper(trim(<column>))",
+        ))
+
+    if sets["casts"]:
+        steps.append(_step(
+            "type_cast",
+            "Cast money to NUMERIC",
+            "FLOAT64 cannot represent large decimal amounts exactly, so totals "
+            "drift. NUMERIC is exact.",
+            list(sets["casts"]),
+            "; ".join(rec["evidence"] for rec in by_category.get("type_cast", [])),
+            "cast(<column> as numeric)",
+        ))
+
+    if sets["periods"]:
+        steps.append(_step(
+            "derive_period",
+            "Derive period columns from the date",
+            "Month, year and quarter are computed once here so gold does not "
+            "re-derive them on every query.",
+            list(sets["periods"]),
+            "",
+            "date_trunc(<column>, month), extract(year from <column>), "
+            "extract(quarter from <column>)",
+        ))
+
+    if sets["labels"]:
+        steps.append(_step(
+            "categorise",
+            "Add a readable label per code",
+            "Emits a CASE with an explicit `else 'Unmapped'`, so a new code "
+            "shows up as unmapped instead of silently becoming null. The "
+            "mappings themselves are left as a TODO for you to fill in.",
+            list(sets["labels"]),
+            "; ".join(rec["evidence"] for rec in by_category.get("categorisation", [])),
+            "case <column> ... else 'Unmapped' end as <column>_label",
+        ))
+
+    if sets["splits"]:
+        steps.append(_step(
+            "split_sign",
+            "Split mixed-sign amounts into debit and credit",
+            "A single signed column forces every consumer to know the sign "
+            "convention. Splitting it makes both measures additive.",
+            list(sets["splits"]),
+            "",
+            "abs(<column>) as <column>_abs, plus debit_amount / credit_amount",
+        ))
+
+    if sets["flags"]:
+        steps.append(_step(
+            "quality_flag",
+            "Stamp quality flags instead of dropping rows",
+            "Silver never drops a row for a quality reason. The problem is "
+            "flagged on the row so it stays visible and countable.",
+            list(sets["flags"]),
+            "; ".join(rec["evidence"] for rec in by_category.get("quality_flag", [])),
+            "<column> is null as _is_missing_<column>",
+        ))
+
+    steps.append(_step(
+        "audit",
+        "Stamp audit columns",
+        "Every row records the run that produced it, via the "
+        "asg_audit_columns('silver') macro.",
+        [name for name, _, _ in AUDIT_MACRO_COLUMNS],
+        "",
+        "{{ asg_audit_columns('silver') }}",
+    ))
+
+    # ---------------- resulting schema ----------------
+
+    out_columns = _plan_columns(columns, sets, key_columns, dropped)
+
+    # ---------------- estimated rows ----------------
+
+    estimate = _plan_row_estimate(profile, duplicate, bool(dedup_recs and key_columns))
+
+    tests: List[Dict[str, Any]] = [
+        {
+            "column": ", ".join(rec["columns"]) or "table",
+            "tests": rec["sql_hint"] or "data_tests",
+            "why": rec["evidence"],
+        }
+        for rec in by_category.get("testing", [])
+    ]
+    if key_columns:
+        tests.append({
+            "column": ", ".join(key_columns),
+            "tests": "data_tests: [unique, not_null]",
+            "why": "The business key silver deduplicates on.",
+        })
+
+    return {
+        "model_name": target_name,
+        "source_model": source_model,
+        "path": f"models/silver/{target_name}.sql",
+        "materialized": materialized,
+        "sources": sources,
+        "steps": steps,
+        "columns": out_columns,
+        "column_count": len(out_columns),
+        "dropped_columns": sorted(dropped),
+        "key_columns": key_columns,
+        "row_estimate": estimate,
+        "tests": tests,
+        "applied": [
+            {"id": rec["id"], "category": rec["category"], "title": rec["title"]}
+            for rec in accepted
+        ],
+        "skipped": [
+            {"id": rec["id"], "category": rec["category"], "title": rec["title"]}
+            for rec in (analysis.get("recommendations") or [])
+            if rec not in accepted
+        ],
+    }
+
+
+def _plan_columns(
+    columns: Dict[str, Any],
+    sets: Dict[str, set],
+    key_columns: List[str],
+    dropped: set,
+) -> List[Dict[str, Any]]:
+    """
+    The columns the generated model would output, in emission order.
+
+    Mirrors _build_select. `origin` says where each column came from, which is
+    the part that makes the preview trustworthy: a reviewer can see at a glance
+    that nothing appeared out of nowhere.
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def emit(name: str, data_type: str, origin: str, note: str = "",
+             source: str = "") -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        out.append({
+            "name": name,
+            "data_type": data_type,
+            "origin": origin,
+            "note": note,
+            "source_column": source or (name if origin == "passthrough" else ""),
+        })
+
+    def declared(name: str) -> str:
+        return str((columns.get(name) or {}).get("data_type_yaml") or "unknown")
+
+    for name in key_columns:
+        emit(name, declared(name), "key", "Business key, carried through unchanged.")
+
+    remaining = [n for n in columns if n not in key_columns and n not in dropped]
+    business = [n for n in remaining if not n.startswith("_")]
+    audit = [n for n in remaining if n.startswith("_")]
+
+    for name in business:
+        if name not in sets["periods"]:
+            continue
+        emit(name, declared(name), "passthrough", "The date itself.")
+        emit("period_month", "date", "derived", f"date_trunc({name}, month)", name)
+        emit("period_year", "int64", "derived", f"extract(year from {name})", name)
+        emit("period_quarter", "int64", "derived", f"extract(quarter from {name})", name)
+
+    for name in business:
+        if name in sets["periods"]:
+            continue
+
+        data_type = declared(name)
+        origin = "passthrough"
+        note = ""
+
+        if name in sets["casts"]:
+            data_type = "numeric"
+            origin = "recast"
+            note = f"cast from {declared(name)} for exact decimal arithmetic"
+        elif name in sets["blanks"]:
+            origin = "cleaned"
+            note = "empty strings normalised to null"
+        elif name in sets["uppers"]:
+            origin = "cleaned"
+            note = "upper(trim(...))"
+        elif name in sets["trims"]:
+            origin = "cleaned"
+            note = "trim(...)"
+
+        emit(name, data_type, origin, note)
+
+        if name in sets["labels"]:
+            emit(f"{name}_label", "string", "derived",
+                 "CASE mapping, unmapped codes fall through to 'Unmapped'", name)
+
+        if name in sets["splits"] and (columns.get(name) or {}).get("category") == "numeric":
+            emit(f"{name}_abs", "numeric", "derived", f"abs({name})", name)
+            emit("debit_amount", "numeric", "derived",
+                 f"{name} when it is zero or positive", name)
+            emit("credit_amount", "numeric", "derived",
+                 f"{name} when it is negative, as a positive number", name)
+
+    for name in sorted(sets["flags"]):
+        if name not in columns:
+            continue
+        emit(f"_is_missing_{name}", "bool", "flag",
+             f"true when {name} is null", name)
+
+    for name in audit:
+        emit(name, declared(name), "passthrough", "Bronze lineage column.")
+
+    for name, data_type, note in AUDIT_MACRO_COLUMNS:
+        emit(name, data_type, "macro", note)
+
+    return out
+
+
+def _plan_row_estimate(
+    profile: Dict[str, Any],
+    duplicate: Dict[str, Any],
+    deduplicating: bool,
+) -> Dict[str, Any]:
+    """
+    Estimate the output row count from measurements already taken.
+
+    Deliberately not a dry run. The generated model calls project macros, so
+    only dbt can compile it - a dry run would fail on the Jinja, not on the
+    logic. The profile and the group-by already answer the question exactly in
+    the common case, and where they cannot the basis says so.
+    """
+    declared = int(profile.get("declared_row_count") or profile.get("row_count") or 0)
+    sampled = bool(profile.get("sampled"))
+
+    if not deduplicating:
+        return {
+            "rows": declared,
+            "exact": not sampled,
+            "basis": "Silver never drops rows for quality reasons, and no "
+                     "deduplication was accepted, so the row count carries "
+                     "through unchanged.",
+            "source_rows": declared,
+            "removed": 0,
+        }
+
+    if duplicate.get("checked") and duplicate.get("key_groups") is not None:
+        groups = int(duplicate.get("key_groups") or 0)
+        surplus = int(duplicate.get("surplus_rows") or 0)
+        return {
+            "rows": groups,
+            "exact": not sampled,
+            "basis": f"Deduplication keeps one row per key. The group-by counted "
+                     f"{groups:,} distinct key(s), so {surplus:,} surplus row(s) "
+                     f"would be removed.",
+            "source_rows": declared,
+            "removed": surplus,
+        }
+
+    return {
+        "rows": None,
+        "exact": False,
+        "basis": "Deduplication is proposed but the key was never verified with "
+                 "a group-by, so the output count is unknown.",
+        "source_rows": declared,
+        "removed": None,
+    }

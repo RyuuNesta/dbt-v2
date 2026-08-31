@@ -25,3 +25,4 @@ Thumbs.db
 *-keyfile.json
 *service-account*.json
 .env
+dbt_internal_packages/
