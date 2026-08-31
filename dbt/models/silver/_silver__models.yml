@@ -1,0 +1,182 @@
+version: 2
+
+models:
+  - name: silver_gl_entries
+    description: >
+      Cleaned and conformed general ledger entries, deduplicated to one row per
+      business key. This is where the original stg_gl_entries.sql logic now
+      lives, with four corrections: deduplication on re-ingest, an explicit
+      Unmapped branch instead of silent NULLs, debit/credit driven by the
+      source flag rather than the sign of the amount, and period columns
+      pre-derived so gold never re-computes them.
+
+      Rows are never dropped for quality reasons. Problems are flagged on the
+      row via the _has_* / _is_* columns so they stay visible.
+    config:
+      materialized: view
+
+    columns:
+      - name: gl_entry_key
+        data_type: string
+        description: Surrogate key inherited from bronze. Unique after deduplication.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: document_number
+        data_type: int64
+        description: SAP accounting document number.
+        data_tests:
+          - not_null
+
+      - name: company_code
+        data_type: int64
+        description: SAP company code (BUKRS).
+        data_tests:
+          - not_null
+
+      - name: fiscal_year
+        data_type: int64
+        description: Fiscal year the document was posted into (GJAHR).
+        data_tests:
+          - not_null
+
+      - name: posting_date
+        data_type: date
+        description: Posting date of the document.
+        data_tests:
+          - not_null
+
+      - name: period_month
+        data_type: date
+        description: >
+          posting_date truncated to the first day of the month. Pre-derived here
+          so gold can partition on it directly.
+        data_tests:
+          - not_null
+
+      - name: period_year
+        data_type: int64
+        description: Calendar year extracted from posting_date.
+
+      - name: period_quarter
+        data_type: int64
+        description: Calendar quarter (1-4) extracted from posting_date.
+
+      - name: document_type
+        data_type: string
+        description: SAP document type (BLART).
+        data_tests:
+          - not_null
+
+      - name: gl_account
+        data_type: int64
+        description: General ledger account number (HKONT).
+
+      - name: cost_center
+        data_type: string
+        description: Cost center, trimmed. Empty strings normalised to NULL.
+
+      - name: currency
+        data_type: string
+        description: Currency code, upper-cased and trimmed.
+
+      - name: debit_credit
+        data_type: string
+        description: Debit/credit indicator, upper-cased and trimmed.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['D', 'C']
+
+      - name: vendor_customer
+        data_type: string
+        description: Counterparty identifier, trimmed. Empty strings normalised to NULL.
+
+      - name: description
+        data_type: string
+        description: Line item description, trimmed. Empty strings normalised to NULL.
+
+      - name: transaction_category
+        data_type: string
+        description: >
+          Business label for document_type. SA becomes GL Posting, KR becomes
+          Vendor Invoice, DR becomes Customer Invoice. Anything unrecognised
+          becomes Unmapped rather than NULL, so new document types surface
+          instead of disappearing.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['GL Posting', 'Vendor Invoice', 'Customer Invoice', 'Unmapped']
+
+      - name: account_group
+        data_type: string
+        description: >
+          Coarse account classification derived from the gl_account range.
+          400000-499999 Revenue, 500000-599999 Expense, 100000-199999
+          Receivable, everything else Other.
+        data_tests:
+          - not_null
+
+      - name: amount_local
+        data_type: numeric
+        description: Signed amount in local currency, as received.
+        data_tests:
+          - not_null
+
+      - name: amount_abs
+        data_type: numeric
+        description: Absolute value of amount_local, for magnitude-based aggregation.
+
+      - name: debit_amount
+        data_type: numeric
+        description: >
+          Absolute amount when debit_credit is D, otherwise zero. Driven by the
+          source flag, not by the sign of the amount.
+
+      - name: credit_amount
+        data_type: numeric
+        description: >
+          Absolute amount when debit_credit is C, otherwise zero. Driven by the
+          source flag, not by the sign of the amount.
+
+      - name: _has_unmapped_doc_type
+        data_type: boolean
+        description: True when document_type falls outside SA, KR and DR.
+
+      - name: _has_sign_conflict
+        data_type: boolean
+        description: >
+          True when the debit_credit flag disagrees with the sign of
+          amount_local. Worth investigating at source rather than patching here.
+
+      - name: _is_missing_counterparty
+        data_type: boolean
+        description: >
+          True when vendor_customer is absent. Expected for pure GL postings, so
+          this is informational rather than an error.
+
+      - name: _is_zero_amount
+        data_type: boolean
+        description: True when amount_local is exactly zero.
+
+      - name: _source_relation
+        data_type: string
+        description: Original source relation, carried through from bronze.
+
+      - name: _bronze_loaded_at
+        data_type: timestamp
+        description: When the row landed in bronze. Enables bronze-to-silver latency checks.
+
+      - name: _silver_loaded_at
+        data_type: timestamp
+        description: UTC timestamp when this row was materialised into silver.
+
+      - name: _dbt_invocation_id
+        data_type: string
+        description: dbt invocation id that produced the row.
+
+      - name: _dbt_target
+        data_type: string
+        description: dbt target the row was built with.

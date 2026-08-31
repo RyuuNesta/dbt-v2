@@ -1,0 +1,98 @@
+name: 'asg_data_platform'
+version: '1.0.0'
+config-version: 2
+
+# Which profile (in profiles.yml) this project connects with.
+# Overridable per-run with:  dbt run --profile data_analytics_asg_test
+profile: 'data_analytics_asg'
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+# NOTE: dbt_ui/ is deliberately NOT listed here. The UI lives inside the
+# project folder but dbt never parses it.
+model-paths: ['models']
+seed-paths: ['seeds']
+test-paths: ['tests']
+macro-paths: ['macros']
+snapshot-paths: ['snapshots']
+analysis-paths: ['analyses']
+
+clean-targets:
+  - 'target'
+  - 'dbt_packages'
+
+# ---------------------------------------------------------------------------
+# Models - medallion architecture
+# ---------------------------------------------------------------------------
+# Dataset routing is handled by macros/generate_schema_name.sql:
+#   target=prod  ->  bronze_dbt      / silver_dbt      / gold_dbt      (exact)
+#   target=dev   ->  dbt_dev_bronze  / dbt_dev_silver  / dbt_dev_gold  (prefixed)
+# Developers therefore can never overwrite a production table by accident.
+models:
+  asg_data_platform:
+    +persist_docs:
+      relation: true
+      columns: true
+
+    bronze:
+      +schema: bronze
+      +materialized: table
+      +tags: ['bronze']
+
+    silver:
+      +schema: silver
+      +materialized: view
+      +tags: ['silver']
+
+    gold:
+      +schema: gold
+      +materialized: table
+      +tags: ['gold']
+
+    examples:
+      +materialized: view
+      +tags: ['example']
+
+# ---------------------------------------------------------------------------
+# Seeds
+# ---------------------------------------------------------------------------
+# Explicit column_types stop BigQuery from guessing (it would read
+# amount_local as FLOAT64 and lose cent-level precision on money).
+seeds:
+  asg_data_platform:
+    +schema: seeds
+    +tags: ['seed']
+    gl_entries:
+      # Description lives in seeds/_seeds__gl_entries.yml. dbt 1.12 deprecates
+      # custom keys such as +description inside dbt_project.yml config blocks.
+      +column_types:
+        document_number: INT64
+        company_code: INT64
+        fiscal_year: INT64
+        posting_date: DATE
+        document_type: STRING
+        gl_account: INT64
+        cost_center: STRING
+        amount_local: NUMERIC
+        currency: STRING
+        debit_credit: STRING
+        vendor_customer: STRING
+        description: STRING
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+data_tests:
+  asg_data_platform:
+    +store_failures: true
+    +schema: test_failures
+    +severity: warn
+
+# ---------------------------------------------------------------------------
+# Docs
+# ---------------------------------------------------------------------------
+vars:
+  # Rows the UI pulls when previewing a relation. Kept small so ad-hoc
+  # exploration never turns into an expensive BigQuery scan.
+  ui_preview_limit: 200

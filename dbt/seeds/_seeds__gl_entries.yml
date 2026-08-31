@@ -1,0 +1,113 @@
+version: 2
+
+seeds:
+  - name: gl_entries
+    description: >
+      Synthetic SAP-style general ledger extract used as a stand-in for the real
+      finance feed. Fifteen rows covering two company codes across fiscal year
+      2026. Safe to run anywhere - it contains no production data - which makes
+      it the recommended smoke test after the dbt Cloud to dbt Core migration.
+    config:
+      column_types:
+        document_number: INT64
+        company_code: INT64
+        fiscal_year: INT64
+        posting_date: DATE
+        document_type: STRING
+        gl_account: INT64
+        cost_center: STRING
+        amount_local: NUMERIC
+        currency: STRING
+        debit_credit: STRING
+        vendor_customer: STRING
+        description: STRING
+
+    columns:
+      - name: document_number
+        data_type: int64
+        description: SAP accounting document number. Unique within company_code and fiscal_year.
+        data_tests:
+          - not_null
+
+      - name: company_code
+        data_type: int64
+        description: SAP company code (BUKRS). 1000 and 2000 in this sample.
+        data_tests:
+          - not_null
+          # quote: false is required on numeric columns. accepted_values quotes
+          # its values by default, which BigQuery rejects with
+          # "No matching signature for operator IN for argument types INT64 and
+          # {STRING}".
+          - accepted_values:
+              arguments:
+                values: [1000, 2000]
+                quote: false
+
+      - name: fiscal_year
+        data_type: int64
+        description: Fiscal year the document was posted into (GJAHR).
+        data_tests:
+          - not_null
+
+      - name: posting_date
+        data_type: date
+        description: Date the document was posted to the ledger (BUDAT).
+        data_tests:
+          - not_null
+
+      - name: document_type
+        data_type: string
+        description: >
+          SAP document type (BLART). SA = GL posting, KR = vendor invoice,
+          DR = customer invoice.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['SA', 'KR', 'DR']
+
+      - name: gl_account
+        data_type: int64
+        description: General ledger account number (HKONT).
+        data_tests:
+          - not_null
+
+      - name: cost_center
+        data_type: string
+        description: Cost center the posting is attributed to (KOSTL).
+
+      - name: amount_local
+        data_type: numeric
+        description: >
+          Amount in local currency (DMBTR). Signed - negative values are
+          credits. Held as NUMERIC rather than FLOAT64 so large IDR amounts stay
+          exact to the cent.
+        data_tests:
+          - not_null
+
+      - name: currency
+        data_type: string
+        description: ISO 4217 currency code of amount_local (WAERS).
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['IDR']
+
+      - name: debit_credit
+        data_type: string
+        description: Debit/credit indicator (SHKZG). D = debit, C = credit.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ['D', 'C']
+
+      - name: vendor_customer
+        data_type: string
+        description: >
+          Counterparty identifier. V-prefixed for vendors, C-prefixed for
+          customers. Empty for pure GL postings, which is expected rather than a
+          data quality problem.
+
+      - name: description
+        data_type: string
+        description: Free-text line item description (SGTXT).

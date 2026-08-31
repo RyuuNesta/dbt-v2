@@ -1,0 +1,27 @@
+# dbt build artifacts
+target/
+dbt_packages/
+logs/
+.user.yml
+
+# dbt UI runtime state
+dbt_ui/.runtime/
+dbt_ui/**/__pycache__/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Credentials - never commit these. profiles.yml here is oauth-only and safe,
+# but keyfiles are not.
+*-keyfile.json
+*service-account*.json
+.env

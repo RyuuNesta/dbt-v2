@@ -1,0 +1,96 @@
+# ===========================================================================
+# ASG data platform - dbt Core connection profiles
+# ===========================================================================
+# This file lives in the project so the whole data team shares one definition.
+# dbt is invoked with --profiles-dir pointing here, which means nobody has to
+# hand-maintain a copy in ~/.dbt.
+#
+# Authentication is oauth: it reuses the gcloud login already on the machine.
+# There are no keys or secrets in this file, so it is safe to commit.
+# Refresh credentials with:
+#     gcloud auth application-default login
+#
+# IMPORTANT - REGION. Every production dataset in data-analytics-asg
+# (BRONZE, SILVER, GOLD, bronze_dbt, silver_dbt, gold_dbt, ASG_DATALAKE)
+# is in asia-southeast2. BigQuery cannot join across regions, so a target
+# must sit in asia-southeast2 to read production data.
+# ===========================================================================
+
+data_analytics_asg:
+  target: dev
+
+  outputs:
+
+    # -----------------------------------------------------------------------
+    # dev - individual development sandbox. This is the default.
+    # Writes to dbt_dev_bronze / dbt_dev_silver / dbt_dev_gold, so a dev run
+    # can never overwrite a production table. See macros/generate_schema_name.
+    # -----------------------------------------------------------------------
+    dev:
+      type: bigquery
+      method: oauth
+      project: data-analytics-asg
+      dataset: dbt_dev
+      location: asia-southeast2
+      threads: 4
+      priority: interactive
+      job_execution_timeout_seconds: 300
+      job_retries: 1
+
+    # -----------------------------------------------------------------------
+    # test - shared CI / smoke-test target, same region as production so it
+    # can read real sources. Writes to dbt_ci_* datasets.
+    # -----------------------------------------------------------------------
+    test:
+      type: bigquery
+      method: oauth
+      project: data-analytics-asg
+      dataset: dbt_ci
+      location: asia-southeast2
+      threads: 8
+      priority: interactive
+      job_execution_timeout_seconds: 600
+      job_retries: 2
+
+    # -----------------------------------------------------------------------
+    # prod - orchestrator only. Writes the exact dataset names the business
+    # already reads: bronze_dbt, silver_dbt, gold_dbt.
+    # Do not select this target from a laptop.
+    # -----------------------------------------------------------------------
+    prod:
+      type: bigquery
+      method: oauth
+      project: data-analytics-asg
+      dataset: dbt_prod
+      location: asia-southeast2
+      threads: 8
+      priority: batch
+      job_execution_timeout_seconds: 1800
+      job_retries: 2
+
+# ===========================================================================
+# LEGACY - kept so existing scripts that pass
+# `--profile data_analytics_asg_test` keep working.
+#
+# WARNING: this profile is pinned to location US, but dbt_testing is the only
+# dataset in the project that lives in US. It works for fully self-contained
+# runs (seeds plus models that only ref those seeds - which is why the
+# gl_entries test passed) but any model that reads BRONZE / SILVER / GOLD will
+# fail with a cross-region error.
+#
+# Prefer:  --target test   on the data_analytics_asg profile above.
+# ===========================================================================
+data_analytics_asg_test:
+  target: dev
+
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: data-analytics-asg
+      dataset: dbt_testing
+      location: US
+      threads: 4
+      priority: interactive
+      job_execution_timeout_seconds: 300
+      job_retries: 1

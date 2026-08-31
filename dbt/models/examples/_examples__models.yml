@@ -1,0 +1,27 @@
+version: 2
+
+models:
+  - name: my_first_dbt_model_testing
+    description: >
+      Starter smoke-test model. Materialised as a view so it costs nothing to
+      keep around. Useful as a two-second check that credentials, profile and
+      dataset permissions all work before running the real pipeline.
+    columns:
+      - name: id
+        data_type: int64
+        description: The primary key for this table.
+        data_tests:
+          - unique
+          - not_null
+
+  - name: my_second_dbt_model_testing
+    description: >
+      Second starter model. Proves that ref() resolution and model-to-model
+      dependency ordering work end to end.
+    columns:
+      - name: id
+        data_type: int64
+        description: The primary key for this table.
+        data_tests:
+          - unique
+          - not_null

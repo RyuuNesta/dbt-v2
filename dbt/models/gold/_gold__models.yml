@@ -1,0 +1,145 @@
+version: 2
+
+models:
+  - name: gold_gl_monthly_summary
+    description: >
+      Business-facing monthly general ledger aggregate. One row per company
+      code, month, account group and transaction category, with MTD and YTD
+      measures plus rolled-up data quality counters.
+
+      Shaped to match the conventions already used by gold_dbt.kpi_monthly and
+      gold_dbt.fact_financial so it drops into existing BI models without
+      surprises.
+    config:
+      materialized: table
+      partition_by:
+        field: period_month
+        data_type: date
+        granularity: month
+      cluster_by: ['company_code', 'account_group']
+
+    columns:
+      - name: gl_summary_key
+        data_type: string
+        description: >
+          Surrogate key over the full grain (company_code, period_month,
+          account_group, transaction_category). Unique by construction.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: company_code
+        data_type: int64
+        description: SAP company code (BUKRS).
+        data_tests:
+          - not_null
+
+      - name: period_month
+        data_type: date
+        description: First day of the reporting month. Table partition key.
+        data_tests:
+          - not_null
+
+      - name: period_year
+        data_type: int64
+        description: Calendar year of period_month.
+
+      - name: period_quarter
+        data_type: int64
+        description: Calendar quarter of period_month.
+
+      - name: account_group
+        data_type: string
+        description: Coarse account classification (Revenue, Expense, Receivable, Other).
+
+      - name: transaction_category
+        data_type: string
+        description: Business label for the document type.
+
+      - name: entry_count
+        data_type: int64
+        description: Number of ledger lines in the group.
+
+      - name: document_count
+        data_type: int64
+        description: Distinct accounting documents in the group.
+
+      - name: counterparty_count
+        data_type: int64
+        description: Distinct vendors or customers in the group.
+
+      - name: debit_amount_mtd
+        data_type: numeric
+        description: Sum of debit_amount for the month.
+
+      - name: credit_amount_mtd
+        data_type: numeric
+        description: Sum of credit_amount for the month.
+
+      - name: net_amount_mtd
+        data_type: numeric
+        description: debit_amount_mtd minus credit_amount_mtd.
+
+      - name: gross_amount_mtd
+        data_type: numeric
+        description: Sum of absolute amounts, ignoring direction.
+
+      - name: avg_entry_amount
+        data_type: numeric
+        description: Mean absolute line amount in the group.
+
+      - name: max_entry_amount
+        data_type: numeric
+        description: Largest absolute line amount in the group. Useful for outlier review.
+
+      - name: unmapped_doc_type_count
+        data_type: int64
+        description: Lines whose document_type was not recognised.
+
+      - name: sign_conflict_count
+        data_type: int64
+        description: Lines where the debit/credit flag disagreed with the amount sign.
+
+      - name: missing_counterparty_count
+        data_type: int64
+        description: Lines with no vendor or customer attached.
+
+      - name: debit_amount_ytd
+        data_type: numeric
+        description: Running debit total within company, year, account group and category.
+
+      - name: credit_amount_ytd
+        data_type: numeric
+        description: Running credit total within company, year, account group and category.
+
+      - name: net_amount_ytd
+        data_type: numeric
+        description: Running net total within company, year, account group and category.
+
+      - name: _is_positive_mtd
+        data_type: boolean
+        description: True when net_amount_mtd is zero or above.
+
+      - name: _is_positive_ytd
+        data_type: boolean
+        description: True when net_amount_ytd is zero or above.
+
+      - name: _is_sign_clean
+        data_type: boolean
+        description: True when no line in the group had a debit/credit sign conflict.
+
+      - name: _silver_loaded_at
+        data_type: timestamp
+        description: Latest silver load timestamp contributing to this group.
+
+      - name: _gold_loaded_at
+        data_type: timestamp
+        description: UTC timestamp when this aggregate was built.
+
+      - name: _dbt_invocation_id
+        data_type: string
+        description: dbt invocation id that produced the row.
+
+      - name: _dbt_target
+        data_type: string
+        description: dbt target the row was built with.

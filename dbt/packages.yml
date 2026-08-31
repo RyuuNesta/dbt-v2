@@ -1,0 +1,19 @@
+# Pinned to exact versions so every machine and the orchestrator resolve
+# identically. Run `dbt deps` after changing anything here.
+#
+# Version check against dbt-core 1.12.3:
+#   codegen 0.14.1   requires dbt >=1.1.0,<3.0.0   OK
+#   dbt_utils 1.4.1  requires dbt >=1.3.0,<3.0.0   OK
+#
+# Your original pin was codegen 0.13.0. It does still resolve on dbt 1.12
+# (it allows <2.0.0) but 0.14.1 is the current release and widens the ceiling
+# to <3.0.0, so it will survive the next dbt major without another change.
+packages:
+  # generate_source / generate_model_yaml / generate_base_model.
+  # The UI calls these to scaffold YAML from a live BigQuery relation.
+  - package: dbt-labs/codegen
+    version: 0.14.1
+
+  # Generic tests and SQL helpers used across the medallion layers.
+  - package: dbt-labs/dbt_utils
+    version: 1.4.1

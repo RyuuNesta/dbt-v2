@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>dbt Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23ff694a'/><path d='M9 16.5 14 21l9-11' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    /* Applied before the stylesheet paints, so a light-theme user never sees a
+       dark flash on load. Deliberately inline and synchronous. */
+    (function () {
+      try {
+        var t = localStorage.getItem('dbtstudio.theme');
+        document.documentElement.dataset.theme =
+          (t === 'dark' || t === 'light' || t === 'auto') ? t : 'auto';
+        document.documentElement.dataset.help =
+          localStorage.getItem('dbtstudio.help') === 'on' ? 'on' : 'off';
+      } catch (e) {
+        document.documentElement.dataset.theme = 'auto';
+      }
+    })();
+  </script>
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<div class="app" id="app">
+
+  <!-- ================= sidebar ================= -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26">
+          <rect width="32" height="32" rx="7" fill="currentColor"/>
+          <path d="M9 16.5 14 21l9-11" stroke="#fff" stroke-width="3"
+                fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <span class="brand-text">
+        <strong>dbt Studio</strong>
+        <small id="brand-project">loading…</small>
+      </span>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="Main sections">
+      <button class="nav-item" data-view="overview"
+              data-help="Project health at a glance: what exists, what passed, what needs attention.">
+        <span class="nav-ico" aria-hidden="true">◈</span>
+        <span class="nav-text">Overview</span>
+        <kbd aria-hidden="true">1</kbd>
+      </button>
+      <button class="nav-item" data-view="pipeline"
+              data-help="Your data flow drawn left to right, from raw to business-ready.">
+        <span class="nav-ico" aria-hidden="true">⬡</span>
+        <span class="nav-text">Pipeline</span>
+        <kbd aria-hidden="true">2</kbd>
+      </button>
+      <button class="nav-item" data-view="workbench"
+              data-help="Write and run SQL. Explore the data without touching it.">
+        <span class="nav-ico" aria-hidden="true">▶</span>
+        <span class="nav-text">Workbench</span>
+        <kbd aria-hidden="true">3</kbd>
+      </button>
+      <button class="nav-item" data-view="schema"
+              data-help="Describe your tables: column names, types and what each one means.">
+        <span class="nav-ico" aria-hidden="true">☰</span>
+        <span class="nav-text">Documentation</span>
+        <kbd aria-hidden="true">4</kbd>
+      </button>
+      <button class="nav-item" data-view="advisor"
+              data-help="Measures your raw data and suggests how to clean it.">
+        <span class="nav-ico" aria-hidden="true">✦</span>
+        <span class="nav-text">Cleanup Advisor</span>
+        <kbd aria-hidden="true">5</kbd>
+      </button>
+      <button class="nav-item" data-view="runs"
+              data-help="Rebuild your tables and watch the progress live.">
+        <span class="nav-ico" aria-hidden="true">⚡</span>
+        <span class="nav-text">Build &amp; Test</span>
+        <kbd aria-hidden="true">6</kbd>
+      </button>
+      <button class="nav-item" data-view="catalog"
+              data-help="Search everything and see how tables connect to each other.">
+        <span class="nav-ico" aria-hidden="true">⌗</span>
+        <span class="nav-text">Catalog</span>
+        <kbd aria-hidden="true">7</kbd>
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="layer-legend" id="layer-legend"></div>
+      <div class="scope-box" id="scope-box" hidden>
+        <span class="scope-title">Dataset scope</span>
+        <div class="scope-list" id="scope-list"></div>
+      </div>
+      <a class="ghost-link" href="/dbt-docs" target="_blank" rel="noopener"
+         id="docs-link">dbt docs ↗</a>
+    </div>
+  </aside>
+
+  <!-- ================= main ================= -->
+  <div class="shell">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1 class="view-title" id="view-title">Overview</h1>
+        <p class="view-sub" id="view-sub"></p>
+      </div>
+
+      <div class="topbar-right">
+        <div class="field-inline">
+          <label for="target-select">Environment</label>
+          <select id="target-select" class="select"
+                  aria-describedby="target-help"></select>
+          <span id="target-help" class="sr-only">
+            Chooses which BigQuery environment every query and build uses.
+          </span>
+        </div>
+
+        <button class="btn btn-ghost" id="btn-refresh-manifest">
+          <span aria-hidden="true">⟳</span>
+          <span class="btn-label">Reload project</span>
+        </button>
+
+        <button class="status-pill" id="conn-pill">
+          <span class="dot" id="conn-dot" aria-hidden="true"></span>
+          <span id="conn-text">checking…</span>
+        </button>
+
+        <div class="icon-group" role="group" aria-label="Display options">
+          <button class="btn btn-icon btn-ghost" id="btn-help"
+                  aria-pressed="false"
+                  title="Show plain-language explanations">
+            <span aria-hidden="true">?</span>
+            <span class="sr-only">Toggle plain-language explanations</span>
+          </button>
+          <button class="btn btn-icon btn-ghost" id="btn-theme"
+                  title="Change appearance">
+            <span aria-hidden="true" id="theme-icon">◐</span>
+            <span class="sr-only">Change appearance</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="content" id="main" tabindex="-1"></main>
+  </div>
+</div>
+
+<!-- ================= drawer ================= -->
+<div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-modal="true" role="dialog"
+       aria-labelledby="drawer-title">
+  <header class="drawer-head">
+    <div>
+      <h2 id="drawer-title">Model</h2>
+      <p class="muted" id="drawer-sub"></p>
+    </div>
+    <button class="btn btn-icon" id="drawer-close" aria-label="Close">✕</button>
+  </header>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<!-- ================= toasts ================= -->
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<!-- ================= run dock ================= -->
+<div class="run-dock" id="run-dock" hidden>
+  <span class="spinner" aria-hidden="true"></span>
+  <span class="run-dock-label" id="run-dock-label">running…</span>
+  <button class="btn btn-tiny" id="run-dock-open">View log</button>
+  <button class="btn btn-tiny btn-danger" id="run-dock-cancel">Cancel</button>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
