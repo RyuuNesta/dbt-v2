@@ -143,6 +143,16 @@ export const api = {
   describe: (body) => request('POST', '/api/warehouse/describe', { body: withTarget(body) }),
   preview: (body) => request('POST', '/api/warehouse/preview', { body: withTarget(body) }),
 
+  /* Scheduled runs. Saving and registering are separate calls on purpose:
+     registering is what lets dbt run unattended. */
+  schedules: () => request('GET', '/api/schedules', { query: { target: state.target } }),
+  saveSchedule: (body) => request('POST', '/api/schedules', { body }),
+  deleteSchedule: (id) => request('POST', '/api/schedules/delete', { body: { id } }),
+  registerSchedule: (id, action) =>
+    request('POST', '/api/schedules/register', { body: { id, action } }),
+  scheduleRuns: (id) => request('GET', '/api/schedules/runs', { query: { id } }),
+  scheduleLog: (log) => request('GET', '/api/schedules/log', { query: { log } }),
+
   dbtRun: (body) => request('POST', '/api/dbt/run', { body: withTarget(body) }),
   jobs: () => request('GET', '/api/dbt/jobs'),
   job: (id, cursor) => request('GET', `/api/dbt/jobs/${id}`, { query: { cursor } }),

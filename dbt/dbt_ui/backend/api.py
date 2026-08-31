@@ -8,6 +8,7 @@ layer knows nothing about sockets.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import time
@@ -22,7 +23,9 @@ from . import (
     modelgen,
     profiling,
     recommend,
+    runlock,
     runner,
+    schedules,
     typing_map,
     warehouse,
     yamlpatch,
@@ -923,6 +926,111 @@ def _tables(request: Request) -> Tuple[int, Any]:
         }
     except warehouse.WarehouseError as exc:
         raise _warehouse_failure(exc) from exc
+
+
+# --------------------------------------------------------------------------
+# scheduled runs
+# --------------------------------------------------------------------------
+
+@ROUTER.get("/api/schedules")
+def _schedules_list(request: Request) -> Tuple[int, Any]:
+    """
+    Every saved schedule, each with what Task Scheduler currently says about it.
+
+    The live query matters: schedules.json records intent, but somebody can
+    disable or delete the task in Task Scheduler and the UI would otherwise keep
+    claiming it is scheduled.
+    """
+    records = schedules.list_schedules()
+    return 200, {
+        "schedules": [schedules.describe(record) for record in records],
+        "runs": schedules.list_runs(limit=40),
+        "lock": runlock.describe(),
+        "commands": list(schedules.SCHEDULABLE_COMMANDS),
+        "frequencies": [
+            {"id": key, **value} for key, value in schedules.FREQUENCIES.items()
+        ],
+        "weekdays": list(schedules.WEEKDAYS),
+        "targets": [target.to_dict()["name"] for target in config.list_targets()],
+        "default_target": config.default_target_name(),
+        "notes": schedules.environment_notes(),
+        "windows": os.name == "nt",
+        "scope": config.scope_description(request.q("target")),
+    }
+
+
+@ROUTER.post("/api/schedules")
+def _schedules_save(request: Request) -> Tuple[int, Any]:
+    """Create or update a schedule. Does not register it with Windows."""
+    try:
+        record = schedules.save(dict(request.body or {}))
+    except schedules.ScheduleError as exc:
+        raise ApiError(str(exc), status=422) from exc
+
+    return 200, {
+        "schedule": schedules.describe(record),
+        "note": (
+            "Saved. It will not run until you register it with Task Scheduler - "
+            "that is a separate step because it makes dbt run unattended."
+        ),
+    }
+
+
+@ROUTER.post("/api/schedules/delete")
+def _schedules_delete(request: Request) -> Tuple[int, Any]:
+    schedule_id = str(request.need("id"))
+    removed = schedules.delete(schedule_id)
+    if not removed:
+        raise ApiError(f"No schedule with id '{schedule_id}'.", status=404)
+    return 200, {"deleted": True, "id": schedule_id}
+
+
+@ROUTER.post("/api/schedules/register")
+def _schedules_register(request: Request) -> Tuple[int, Any]:
+    """
+    Hand the schedule to Windows Task Scheduler, or take it back.
+
+    Kept as an explicit action rather than folded into save: this is the moment
+    dbt gains the ability to run against a real warehouse with nobody watching.
+    """
+    schedule_id = str(request.need("id"))
+    record = schedules.get_schedule(schedule_id)
+    if record is None:
+        raise ApiError(f"No schedule with id '{schedule_id}'.", status=404)
+
+    action = str(request.opt("action") or "register").lower()
+
+    try:
+        if action == "unregister":
+            result = schedules.unregister(record)
+        else:
+            result = schedules.register(record)
+    except schedules.ScheduleError as exc:
+        raise ApiError(str(exc), status=422) from exc
+
+    return 200, {**result, "schedule": schedules.describe(record)}
+
+
+@ROUTER.get("/api/schedules/runs")
+def _schedules_runs(request: Request) -> Tuple[int, Any]:
+    return 200, {
+        "runs": schedules.list_runs(
+            schedule_id=request.q("id"),
+            limit=int(request.q("limit") or 50),
+        ),
+        "lock": runlock.describe(),
+    }
+
+
+@ROUTER.get("/api/schedules/log")
+def _schedules_log(request: Request) -> Tuple[int, Any]:
+    name = request.q("log")
+    if not name:
+        raise ApiError("'log' query parameter is required.")
+    try:
+        return 200, {"log": name, "text": schedules.run_log(str(name))}
+    except schedules.ScheduleError as exc:
+        raise ApiError(str(exc), status=404) from exc
 
 
 @ROUTER.post("/api/models/scaffold")

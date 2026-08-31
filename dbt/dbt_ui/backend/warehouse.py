@@ -23,6 +23,7 @@ import datetime
 import decimal
 import threading
 import time
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -230,7 +231,21 @@ def _credentials(cfg: Dict[str, Any]):
 
     import google.auth
     try:
-        creds, _ = google.auth.default(scopes=_BQ_SCOPES)
+        # google.auth warns on every call when ADC has no quota project. Here
+        # that is the intended configuration - see _without_quota_project - so
+        # the warning is advice we have already taken and acted on, printed once
+        # per client build into a terminal the user is reading for real output.
+        #
+        # Scoped with catch_warnings and matched on the message so this suppresses
+        # exactly that notice and nothing else, including any other warning
+        # google.auth might legitimately raise.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*without a quota project.*",
+                category=UserWarning,
+            )
+            creds, _ = google.auth.default(scopes=_BQ_SCOPES)
     except Exception as exc:
         raise WarehouseError(
             "No Google credentials found. Run "

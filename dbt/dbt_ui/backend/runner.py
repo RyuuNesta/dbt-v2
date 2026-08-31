@@ -32,7 +32,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from . import config, manifest as manifest_mod
+from . import config, manifest as manifest_mod, runlock
 
 MAX_JOBS_RETAINED = 40
 MAX_LINES_PER_JOB = 8000
@@ -412,6 +412,18 @@ def launch(
             f"serialised. Wait for it to finish or cancel it."
         )
 
+    # The registry only knows about this process. A scheduled run is a separate
+    # process invoked by Task Scheduler, so the on-disk lock is what actually
+    # keeps two dbt invocations off the same target/ directory.
+    held = runlock.read()
+    if held is not None:
+        raise JobBusyError(
+            f"Another dbt process is already running: {held.get('owner')} "
+            f"(pid {held.get('pid')}, started {int(held.get('age') or 0)}s ago). "
+            f"That is usually a scheduled run. dbt writes to a shared target/ "
+            f"directory, so this has to wait for it to finish."
+        )
+
     argv = build_argv(command, target=target, **kwargs)
     meta = ALLOWED_COMMANDS[command]
 
@@ -437,6 +449,11 @@ def _run_job(job: Job) -> None:
     job.append(f"$ {job.display_command}", stream="meta")
     job.append(f"  cwd: {config.PROJECT_DIR}", stream="meta")
 
+    # Claim the cross-process lock for the life of this run so a scheduled run
+    # firing now records itself as skipped instead of running concurrently.
+    # Released in the finally at the end of this function.
+    runlock.acquire(f"ui:{job.label}")
+
     creation_flags = 0
     if os.name == "nt":
         # Own process group, so cancelling kills dbt's children too.
@@ -460,6 +477,9 @@ def _run_job(job: Job) -> None:
         job.status = "failed"
         job.exit_code = -1
         job.finished_at = time.time()
+        # dbt never started, so holding the lock would block schedules for
+        # nothing until it aged out.
+        runlock.release()
         return
 
     job.process = process
@@ -501,6 +521,10 @@ def _run_job(job: Job) -> None:
 
         # Any command that can change target/ invalidates the cached manifest.
         manifest_mod.invalidate()
+
+        # Freed last, so nothing else starts while the manifest is being
+        # invalidated.
+        runlock.release()
 
 
 _NOISE_PATTERNS = (
