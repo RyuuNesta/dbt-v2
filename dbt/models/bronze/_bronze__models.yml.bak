@@ -1,0 +1,79 @@
+version: 2
+
+models:
+  - name: bronze_gl_entries
+    description: TODO describe bronze gl entries.
+
+    columns:
+      - name: gl_entry_key
+        data_type: string
+        description: >
+          Deterministic surrogate key, md5 of document_number, company_code and
+          fiscal_year. Stable across runs, so it is safe to join on downstream.
+
+      - name: document_number
+        data_type: int64
+        description: 'SAP accounting document number, carried through unchanged.'
+
+      - name: company_code
+        data_type: int64
+        description: 'SAP company code (BUKRS).'
+
+      - name: fiscal_year
+        data_type: int64
+        description: 'Fiscal year the document was posted into (GJAHR).'
+
+      - name: posting_date
+        data_type: date
+        description: 'Posting date, cast from the source string to a real DATE.'
+
+      - name: document_type
+        data_type: string
+        description: 'SAP document type (BLART), unvalidated at this layer.'
+
+      - name: gl_account
+        data_type: int64
+        description: 'General ledger account number (HKONT).'
+
+      - name: cost_center
+        data_type: string
+        description: 'Cost center (KOSTL). Raw - not yet trimmed or null-normalised.'
+
+      - name: currency
+        data_type: string
+        description: 'Currency code of amount_local (WAERS).'
+
+      - name: debit_credit
+        data_type: string
+        description: 'Debit/credit indicator (SHKZG). D = debit, C = credit.'
+
+      - name: vendor_customer
+        data_type: string
+        description: 'Counterparty identifier. Raw, may be an empty string.'
+
+      - name: description
+        data_type: string
+        description: 'Free-text line item description (SGTXT).'
+
+      - name: amount_local
+        data_type: numeric
+        description: >
+          Signed amount in local currency, cast to NUMERIC to preserve cent-level
+          precision on large IDR values.
+
+      - name: _source_relation
+        data_type: string
+        description: 'Where this row was read from, for lineage debugging.'
+
+      - name: _bronze_loaded_at
+        data_type: timestamp
+        description: UTC timestamp when this row landed in bronze.
+
+      - name: _dbt_invocation_id
+        data_type: string
+        description: >
+          dbt invocation id that produced the row. Ties data back to a specific run.
+
+      - name: _dbt_target
+        data_type: string
+        description: 'dbt target the row was built with (dev, test, prod).'
