@@ -363,6 +363,136 @@ def schema_yaml(
     }
 
 
+def source_yaml(
+    source_name: str,
+    database: str,
+    schema: str,
+    table: str,
+    columns: List[Dict[str, Any]],
+    table_description: str = "",
+    profiles: Optional[Dict[str, Dict[str, Any]]] = None,
+    include_tests: bool = True,
+    include_descriptions: bool = True,
+    ai_descriptions: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Emit a dbt `sources:` block for a table dbt does not build.
+
+    This is how dbt is told a foreign table exists. Once this block is committed
+    and the project re-parsed, dbt documents the table, includes it in the docs
+    site and lineage, can test it, and it can be referenced with
+    source('<source_name>', '<table>').
+
+    The description drafting is identical to schema_yaml: AI text wins if
+    supplied, otherwise the deterministic pattern rules, so a source declaration
+    reads the same as a model contract.
+
+    Shape produced:
+
+        version: 2
+
+        sources:
+          - name: <source_name>
+            database: <project>
+            schema: <dataset>
+            tables:
+              - name: <table>
+                description: >
+                  ...
+                columns:
+                  - name: ...
+                    data_type: ...
+                    description: ...
+                    data_tests: [...]
+    """
+    profiles = profiles or {}
+    ai_descriptions = ai_descriptions or {}
+    flat = typing_map.flatten_columns(columns)
+
+    lines: List[str] = ["version: 2", "", "sources:"]
+    lines.append(f"{INDENT}- name: {source_name}")
+    # database is the GCP project, schema is the BigQuery dataset. Naming them
+    # explicitly means the source resolves regardless of the active target.
+    lines.append(f"{INDENT * 2}database: {database}")
+    lines.append(f"{INDENT * 2}schema: {schema}")
+    lines.append("")
+    lines.append(f"{INDENT * 2}tables:")
+    lines.append(f"{INDENT * 3}- name: {table}")
+
+    if include_descriptions:
+        desc = table_description or f"TODO describe the {_words(table)} table."
+        lines += _yaml_block(desc, INDENT * 4)
+
+    lines.append("")
+    lines.append(f"{INDENT * 4}columns:")
+
+    review_needed: List[str] = []
+    documented = 0
+
+    for column in flat:
+        col_name = column["name"]
+        std_type = column["data_type"]
+        col_profile = profiles.get(col_name)
+
+        lines.append(f"{INDENT * 5}- name: {col_name}")
+        lines.append(f"{INDENT * 6}data_type: {std_type.lower()}")
+
+        if include_descriptions:
+            ai_text = ai_descriptions.get(col_name, "").strip()
+            if ai_text:
+                drafted = {
+                    "description": ai_text,
+                    "needs_review": ai_text.lower().startswith("unclear"),
+                }
+            else:
+                drafted = describe(column, col_profile, "")
+            lines += _yaml_block(drafted["description"], INDENT * 6)
+            if drafted["needs_review"]:
+                review_needed.append(col_name)
+            else:
+                documented += 1
+
+        if include_tests:
+            tests = _generic_tests(column, col_profile)
+            if tests:
+                lines.append(f"{INDENT * 6}data_tests:")
+                for test in tests:
+                    if test == "accepted_values":
+                        values = [
+                            entry["value"]
+                            for entry in (col_profile or {}).get("top_values", [])
+                        ]
+                        lines.append(f"{INDENT * 7}- accepted_values:")
+                        lines.append(f"{INDENT * 9}arguments:")
+                        if values:
+                            rendered = ", ".join(_yaml_scalar(v) for v in values)
+                            lines.append(f"{INDENT * 10}values: [{rendered}]")
+                        else:
+                            lines.append(f"{INDENT * 10}values: []  # TODO fill in")
+                        if typing_map.is_numeric(std_type):
+                            lines.append(f"{INDENT * 10}quote: false")
+                    else:
+                        lines.append(f"{INDENT * 7}- {test}")
+
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    return {
+        "yaml": "\n".join(lines) + "\n",
+        "column_count": len(flat),
+        "documented": documented,
+        "needs_review": review_needed,
+        "source_name": source_name,
+        "reference": f"{{{{ source('{source_name}', '{table}') }}}}",
+        "columns": [
+            {"name": c["name"], "data_type": c["data_type"].lower()}
+            for c in flat
+        ],
+    }
+
+
 def columns_yaml_fragment(columns: List[Dict[str, Any]]) -> str:
     """
     The bare name / data_type list.
@@ -419,9 +549,20 @@ def silver_model(
     accepted_ids: Optional[Sequence[str]] = None,
     model_name: str = "",
     materialized: str = "view",
+    source_relation: str = "",
 ) -> Dict[str, Any]:
     """
     Build a silver model from the accepted recommendations.
+
+    The source can be either a dbt model or a raw physical table:
+
+      - `source_model` set  -> the model is referenced with ref(), the portable,
+        DAG-aware form used for a table dbt already builds.
+      - `source_relation` set (source_model empty) -> the model reads the table
+        directly by its fully-qualified name, for a pre-existing ("foreign")
+        table dbt does not build. The result is still a real, runnable dbt model;
+        it simply names its input instead of ref()-ing it. A reviewer can swap
+        that line for a source() once the table is declared as one.
 
     The generated SQL is meant to be read and edited. Every non-obvious
     transformation carries the measurement that motivated it as a comment, so a
@@ -437,10 +578,22 @@ def silver_model(
     key_columns = [c for c in (plan.get("key_columns") or []) if c in columns]
     date_columns = [c for c in (plan.get("date_columns") or []) if c in columns]
 
-    target_name = model_name or _silver_name(source_model)
+    # The name the silver model gets, and the label used in prose. For a foreign
+    # table there is no model name, so fall back to the physical table.
+    relation = source_relation or profile.get("relation") or ""
+    source_label = source_model or (profile.get("table") or {}).get("table") or "the source"
+    target_name = model_name or _silver_name(source_label)
     dropped = {
         col for rec in by_category.get("pruning", []) for col in rec["columns"]
     }
+
+    # How the model names its input. A dbt model is ref()'d; a raw table is read
+    # by its fully-qualified, backtick-quoted relation.
+    if source_model:
+        from_clause = f"{{{{ ref('{source_model}') }}}}"
+    else:
+        rel = str(relation).replace("`", "")
+        from_clause = f"`{rel}`" if rel else "-- TODO: set the source table"
 
     header = [
         "{{",
@@ -450,7 +603,7 @@ def silver_model(
         "}}",
         "",
         "/*",
-        f"    SILVER - cleaned and conformed {_words(_strip_layer(source_model))}.",
+        f"    SILVER - cleaned and conformed {_words(_strip_layer(source_label))}.",
         "",
         f"    Generated by the dbt Studio Silver Advisor on "
         f"{datetime.date.today().isoformat()} from a profile of",
@@ -458,13 +611,23 @@ def silver_model(
         + (", sampled" if profile.get("sampled") else "")
         + ").",
         "",
+    ]
+    if not source_model:
+        header += [
+            "    NOTE: the source is a table dbt does not build, so it is read by",
+            "    its full name below rather than through ref(). Declare it as a",
+            "    dbt source and swap in source('<name>','<table>') to bring it",
+            "    fully into the DAG.",
+            "",
+        ]
+    header += [
         "    Review before merging. Each transformation below records the",
         "    measurement that motivated it.",
         "*/",
         "",
     ]
 
-    body: List[str] = ["with bronze as (", "", f"    select * from {{{{ ref('{source_model}') }}}}", "", "),", ""]
+    body: List[str] = ["with bronze as (", "", f"    select * from {from_clause}", "", "),", ""]
 
     dedup_recs = [
         r for r in by_category.get("deduplication", [])
@@ -733,6 +896,7 @@ def silver_plan(
     accepted_ids: Optional[Sequence[str]] = None,
     model_name: str = "",
     materialized: str = "view",
+    source_relation: str = "",
 ) -> Dict[str, Any]:
     """
     Explain how the silver model would be built, without building it.
@@ -756,17 +920,30 @@ def silver_plan(
         column for rec in by_category.get("pruning", []) for column in rec["columns"]
     }
 
-    target_name = model_name or _silver_name(source_model)
+    relation = source_relation or profile.get("relation") or ""
+    source_label = source_model or (profile.get("table") or {}).get("table") or "the source"
+    target_name = model_name or _silver_name(source_label)
+
+    # How the model names its input: ref() for a dbt model, the physical
+    # relation for a foreign table.
+    if source_model:
+        reference = f"{{{{ ref('{source_model}') }}}}"
+        read_note = ("Resolved by dbt at build time, so the same SQL works on "
+                     "every target.")
+    else:
+        rel = str(relation).replace("`", "")
+        reference = f"`{rel}`"
+        read_note = ("Read directly by its full name because dbt does not build "
+                     "this table. Declare it as a dbt source to make it portable.")
 
     # ---------------- sources ----------------
 
     sources = [{
-        "model": source_model,
+        "model": source_model or None,
         "relation": profile.get("relation"),
         "row_count": profile.get("declared_row_count") or profile.get("row_count"),
-        "reference": f"{{{{ ref('{source_model}') }}}}",
-        "note": "Resolved by dbt at build time, so the same SQL works on every "
-                "target.",
+        "reference": reference,
+        "note": read_note,
     }]
 
     # ---------------- steps, in the order the SQL applies them ----------------
@@ -774,10 +951,10 @@ def silver_plan(
     steps: List[Dict[str, Any]] = [
         _step(
             "read",
-            f"Read every row of {source_model}",
+            f"Read every row of {source_label}",
             "The model opens with an unfiltered read. Bronze is the faithful "
             "copy, so nothing is excluded here.",
-            sql=f"select * from {{{{ ref('{source_model}') }}}}",
+            sql=f"select * from {reference}",
         ),
     ]
 

@@ -679,6 +679,46 @@ def list_datasets(target: Optional[str] = None) -> List[Dict[str, Any]]:
     ]
 
 
+def list_all_datasets(target: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Every dataset the credentials can see, allowlist ignored.
+
+    Used only by the access-settings screen: you cannot tick a dataset to grant
+    access to it if the picker refuses to name it. Nothing else should call this
+    - list_datasets() is the filtered version the rest of the app uses, and
+    keeping the two separate is what stops the warehouse browser from becoming a
+    way to enumerate the project.
+
+    Note this still only ever shows what BigQuery IAM already permits. It cannot
+    reveal a dataset the signed-in account has no access to.
+    """
+    _import_bigquery()
+    client, cfg = client_for(target)
+
+    try:
+        datasets = list(client.list_datasets())
+    except Exception as exc:
+        raise _friendly_bq_error(exc, "-- list datasets") from exc
+
+    out: List[Dict[str, Any]] = []
+    for ds in sorted(datasets, key=lambda d: d.dataset_id.lower()):
+        location = None
+        try:
+            # A dataset's region matters here: a cross-region dataset cannot be
+            # joined against the others, so it is worth showing before someone
+            # ticks it. get_dataset is a free metadata call.
+            location = client.get_dataset(f"{ds.project}.{ds.dataset_id}").location
+        except Exception:
+            location = None
+        out.append({
+            "dataset_id": ds.dataset_id,
+            "project": ds.project,
+            "full_id": f"{ds.project}.{ds.dataset_id}",
+            "location": location,
+        })
+    return out
+
+
 def list_tables(dataset: str, target: Optional[str] = None) -> List[Dict[str, Any]]:
     _import_bigquery()
     assert_dataset_allowed(dataset, target, context="listing tables")

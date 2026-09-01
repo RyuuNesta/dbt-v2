@@ -15,6 +15,13 @@ export const state = {
   lastRun: null,
   activeJob: null,
   docsAvailable: false,
+  /* The signed-in user and their permission set, both from the server. Held
+     here only as a cache for shaping the UI - the backend re-checks every
+     request against the database, so editing these in a console gains nothing
+     beyond a briefly misleading screen. */
+  user: null,
+  permissions: {},
+  roles: null,
   /* per-view scratch space so switching tabs does not lose work */
   scratch: {
     workbenchSql: null,
@@ -144,9 +151,25 @@ export const api = {
 
   generateSchema: (body) => request('POST', '/api/schema/generate', { body: withTarget(body) }),
 
+  /* Re-render the proposal YAML from columns already generated, using the
+     descriptions the user edited in place. No warehouse call. No target: the
+     column shapes and profiles are already in hand from generateSchema. */
+  rebuildSchema: (body) => request('POST', '/api/schema/rebuild', { body }),
+
   /* Preview the model file a workbench query would become. Writes nothing;
      committing it goes through writeFile so the .bak behaviour is shared. */
   scaffoldModel: (body) => request('POST', '/api/models/scaffold', { body }),
+
+  /* dbt's own documentation: status of the generated static site, and the
+     committed catalog for one model straight from the manifest. */
+  docsSite: () => request('GET', '/api/docs/site'),
+  modelDetail: (name) => request('GET', `/api/models/${encodeURIComponent(name)}`),
+
+  /* Declare a foreign table (one dbt does not build) as a dbt source, so dbt
+     documents it. Reads the table's schema from BigQuery and drafts a sources:
+     block; rebuild re-renders it from edited descriptions with no warehouse call. */
+  generateSource: (body) => request('POST', '/api/schema/source', { body: withTarget(body) }),
+  rebuildSource: (body) => request('POST', '/api/schema/source/rebuild', { body }),
 
   /* Committed documentation: read, patch in place, export. These deliberately
      do not carry the target - a schema YAML is one file shared by all targets. */
@@ -163,6 +186,45 @@ export const api = {
      compiles nothing - the estimate comes from the profile already taken. */
   previewSilver: (body) => request('POST', '/api/advisor/preview', { body: withTarget(body) }),
   generateSilver: (body) => request('POST', '/api/advisor/generate', { body: withTarget(body) }),
+
+  /* Authentication. The session token lives in an HttpOnly cookie, so there is
+     nothing to attach here - the browser sends it automatically. */
+  login: (email, password) =>
+    request('POST', '/api/auth/login', { body: { email, password } }),
+  logout: () => request('POST', '/api/auth/logout', { body: {} }),
+  session: () => request('GET', '/api/auth/session'),
+  roleCatalogue: () => request('GET', '/api/auth/roles'),
+  /* Flip one cell of the permission matrix. Manager only; the backend enforces
+     that and rejects pinned/lockout-causing changes. */
+  setRolePermission: (role, permission, value) =>
+    request('POST', '/api/roles/permission', { body: { role, permission, value } }),
+  changeOwnPassword: (currentPassword, newPassword) =>
+    request('POST', '/api/auth/password', {
+      body: { current_password: currentPassword, new_password: newPassword },
+    }),
+
+  /* User management. Manager only - the backend enforces that independently of
+     whether the UI chose to show the screen. */
+  users: () => request('GET', '/api/users'),
+  createUser: (email, password, role) =>
+    request('POST', '/api/users/create', { body: { email, password, role } }),
+  setUserRole: (userId, role) =>
+    request('POST', '/api/users/role', { body: { user_id: userId, role } }),
+  setUserActive: (userId, isActive) =>
+    request('POST', '/api/users/active', { body: { user_id: userId, is_active: isActive } }),
+  setUserDatasets: (userId, datasets) =>
+    request('POST', '/api/users/datasets', { body: { user_id: userId, datasets } }),
+  setUserPassword: (userId, password) =>
+    request('POST', '/api/users/password', { body: { user_id: userId, password } }),
+  deleteUser: (userId) =>
+    request('POST', '/api/users/delete', { body: { user_id: userId } }),
+
+  /* Access settings: every dataset the credentials can see, plus which ones the
+     UI is allowed to use, and the active role. */
+  accessSettings: () =>
+    request('GET', '/api/access/settings', { query: { target: state.target } }),
+  saveAccessSettings: (body) =>
+    request('POST', '/api/access/settings', { body, query: { target: state.target } }),
 
   datasets: () => request('GET', '/api/warehouse/datasets', { query: { target: state.target } }),
   /* Row counts and sizes for every in-scope table. Free metadata, cached
@@ -246,6 +308,25 @@ function append(parent, children) {
 export function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
   return node;
+}
+
+/* ------------------------------------------------------------ permissions --- */
+
+/**
+ * Does the signed-in user hold this permission?
+ *
+ * Used to shape the UI: hide what cannot be done, and disable-with-a-reason
+ * where hiding would be confusing. This is a courtesy, not a control - every
+ * one of these is independently enforced server-side, so a user who flips a
+ * flag in the console just gets a 403 from the API instead of a hidden button.
+ */
+export function can(permission) {
+  return Boolean(state.permissions?.[permission]);
+}
+
+/** The active role's display label, e.g. 'Manager'. */
+export function roleLabel() {
+  return state.permissions?.label || state.user?.role || 'unknown';
 }
 
 export const $ = (sel, root = document) => root.querySelector(sel);

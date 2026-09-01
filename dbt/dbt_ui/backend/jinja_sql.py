@@ -282,21 +282,66 @@ def wrap_with_limit(sql: str, limit: int) -> str:
     return f"select * from (\n{stripped}\n) as _dbt_ui_preview\nlimit {int(limit)}"
 
 
-def is_read_only(sql: str) -> Tuple[bool, str]:
-    """
-    Reject anything that is not a read.
-
-    The workbench is for exploration. DDL and DML belong in a model file that
-    goes through review, so a stray DROP typed into a browser tab should never
-    reach the warehouse. Comments and CTEs are stripped before the check so a
-    legitimate query starting with a comment is not misread.
-    """
+def _strip_sql_noise(sql: str) -> str:
+    """Drop comments and a leading paren so the first keyword is visible."""
     text = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     text = re.sub(r"--[^\n]*", " ", text)
-    text = text.strip().lstrip("(").strip()
+    return text.strip().lstrip("(").strip()
+
+
+# The DDL the workbench is allowed to run, so a view or table can be created
+# here the way it can in the BigQuery console. Everything else that changes or
+# destroys existing data (DROP, DELETE, INSERT, MERGE, TRUNCATE, ALTER,
+# CREATE FUNCTION/PROCEDURE, ...) stays blocked and belongs in a reviewed model.
+_CREATE_VIEW_RE = re.compile(
+    r"^create\s+(?:or\s+replace\s+)?(?:materialized\s+)?view\b",
+    re.IGNORECASE,
+)
+# CREATE [OR REPLACE] TABLE [IF NOT EXISTS] ...   Also CTAS.
+# Deliberately not matched: CREATE TABLE FUNCTION, which is a routine, not a
+# table, so the negative lookahead keeps it on the blocked path.
+_CREATE_TABLE_RE = re.compile(
+    r"^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?table\s+"
+    r"(?!function\b)(?:if\s+not\s+exists\s+)?",
+    re.IGNORECASE,
+)
+
+
+def is_view_ddl(sql: str) -> bool:
+    """True when the statement is a CREATE ... VIEW."""
+    return bool(_CREATE_VIEW_RE.match(_strip_sql_noise(sql)))
+
+
+def is_table_ddl(sql: str) -> bool:
+    """True when the statement is a CREATE ... TABLE (including CTAS)."""
+    return bool(_CREATE_TABLE_RE.match(_strip_sql_noise(sql)))
+
+
+def is_create_ddl(sql: str) -> bool:
+    """True for the CREATE VIEW / CREATE TABLE statements the workbench runs."""
+    return is_view_ddl(sql) or is_table_ddl(sql)
+
+
+def is_read_only(sql: str) -> Tuple[bool, str]:
+    """
+    Reject anything that is not a read, with two deliberate exceptions:
+    CREATE VIEW and CREATE TABLE are permitted so they can be defined here the
+    way they are in the BigQuery console.
+
+    Everything else that changes or destroys existing data (INSERT, UPDATE,
+    DELETE, MERGE, DROP, TRUNCATE, ALTER, CREATE FUNCTION/PROCEDURE, ...) stays
+    blocked: that work belongs in a model file that goes through review.
+    Comments and CTEs are stripped before the check so a legitimate query
+    starting with a comment is not misread.
+    """
+    text = _strip_sql_noise(sql)
 
     if not text:
         return False, "The statement is empty."
+
+    # The sanctioned DDL exceptions. Checked before the generic 'create' block.
+    if is_create_ddl(text):
+        return True, ""
 
     first = text.split(None, 1)[0].lower().strip(";")
 
@@ -313,10 +358,15 @@ def is_read_only(sql: str) -> Tuple[bool, str]:
         "load": "LOAD", "replace": "REPLACE",
     }
     if first in blocked:
+        detail = (
+            " Only CREATE VIEW and CREATE TABLE are allowed here; other CREATE "
+            "forms (functions, procedures) belong in the project."
+            if first == "create" else ""
+        )
         return False, (
             f"{blocked[first]} statements are blocked in the workbench. "
             f"Changes to data or schema belong in a dbt model or seed so they "
-            f"go through review and land in the DAG."
+            f"go through review and land in the DAG.{detail}"
         )
 
     return False, (

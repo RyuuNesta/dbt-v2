@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import api, config
+from . import api, auth, config
 
 MAX_BODY_BYTES = 4 * 1024 * 1024  # generous for SQL, far below a DoS
 
@@ -64,9 +64,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _send_json(self, status: int, payload: Any) -> None:
+    def _send_json(self, status: int, payload: Any,
+                   extra_headers: Optional[Dict[str, str]] = None) -> None:
         body = json.dumps(payload, default=str, allow_nan=False).encode("utf-8")
-        self._send(status, body, "application/json; charset=utf-8")
+        self._send(status, body, "application/json; charset=utf-8", extra_headers)
 
     def _read_body(self) -> Dict[str, Any]:
         try:
@@ -134,8 +135,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path.startswith("/api/"):
                 body = self._read_body() if method == "POST" else {}
-                status, payload = api.handle(method, path, query, body)
-                self._send_json(status, payload)
+                # Lower-cased header names so the API layer can look up 'cookie'
+                # without worrying about how the client capitalised it.
+                headers = {k.lower(): v for k, v in self.headers.items()}
+                status, payload, response_headers = api.handle(
+                    method, path, query, body, headers
+                )
+                self._send_json(status, payload, response_headers)
                 return
 
             if path == "/dbt-docs" or path.startswith("/dbt-docs/"):
@@ -260,6 +266,10 @@ def serve(host: Optional[str] = None, port: Optional[int] = None,
 
     config.ensure_runtime_dir()
 
+    # Create the user database and seed the default accounts on first start, so
+    # there is always somebody who can sign in.
+    auth.init()
+
     if not config.DBT_PROJECT_PATH.exists():
         raise SystemExit(
             f"No dbt_project.yml at {config.PROJECT_DIR}.\n"
@@ -276,19 +286,20 @@ def serve(host: Optional[str] = None, port: Optional[int] = None,
   project    {config.project_name()}  ({config.PROJECT_DIR})
   profile    {config.profile_name()}  ->  target '{config.default_target_name()}'
   manifest   {'found' if config.MANIFEST_PATH.exists() else 'missing - click Refresh manifest'}
+  users      {auth.stats()['users']} in {auth.db_path().name}  (sign in required)
   url        {url}
   {'-' * 58}
-  Bound to {host} only. Nothing is exposed to the network.
+  Bound to {host} only.
   Press Ctrl+C to stop.
 """
     print(banner, flush=True)
 
     if host == "0.0.0.0":
         print(
-            "  WARNING: host 0.0.0.0 makes this reachable from the network and\n"
-            "  the UI has no authentication. It can query and write to\n"
-            "  BigQuery with your credentials. Use 127.0.0.1 unless you have\n"
-            "  put an authenticating proxy in front of it.\n",
+            "  WARNING: host 0.0.0.0 makes this reachable from the network.\n"
+            "  Sign-in is required, but the session cookie is sent over plain\n"
+            "  HTTP, so anyone who can watch the traffic can steal it. Put TLS\n"
+            "  in front of it before binding to anything but 127.0.0.1.\n",
             flush=True,
         )
 

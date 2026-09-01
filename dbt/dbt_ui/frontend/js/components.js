@@ -629,7 +629,11 @@ export function sqlEditor({ value = '', onRun, onChange, placeholder = '' } = {}
    */
   function dotContext() {
     const upto = textarea.value.slice(0, textarea.selectionStart);
-    const match = upto.match(/([A-Za-z0-9_]+)\s*\.\s*([A-Za-z0-9_]*)$/);
+    /* The qualifier and the partial can both be backtick-wrapped, e.g.
+       `bronze_dbt`.`bronze_wo   or   bronze_dbt.bronze_wo . Backticks are
+       stripped from the captured groups so the qualifier matches a dataset or
+       alias name and the partial ranks against bare table names. */
+    const match = upto.match(/`?([A-Za-z0-9_-]+)`?\s*\.\s*`?([A-Za-z0-9_]*)`?$/);
     return match ? { qualifier: match[1], partial: match[2] } : null;
   }
 
@@ -725,6 +729,43 @@ export function sqlEditor({ value = '', onRun, onChange, placeholder = '' } = {}
     return [...models, ...sources];
   }
 
+  /** Is this qualifier the name of a dataset the editor knows about? */
+  function isKnownDataset(name) {
+    const lower = String(name || '').toLowerCase();
+    const fromCatalog = (_catalog?.datasets || []).some((d) => d.toLowerCase() === lower);
+    const fromState = (state.datasets || []).some(
+      (d) => String(d.dataset || d.name || d).toLowerCase() === lower,
+    );
+    return fromCatalog || fromState;
+  }
+
+  /**
+   * Tables inside a dataset, offered after `dataset.`.
+   *
+   * This is what makes `bronze_dbt.` suggest the tables in bronze_dbt, the way
+   * the BigQuery console does. The list comes from INFORMATION_SCHEMA via
+   * _datasetSchema and is cached for the session.
+   */
+  async function datasetTableCandidates(datasetName) {
+    const byTable = await _datasetSchema(datasetName);
+    const out = [];
+    for (const entry of byTable.values()) {
+      out.push({
+        kind: 'item',
+        category: 'table',
+        label: entry.table,
+        /* Inserting just the table name completes `dataset.table`; the dataset
+           the user already typed stays put. */
+        insert: entry.table,
+        meta: (entry.table_type && entry.table_type !== 'BASE TABLE')
+          ? entry.table_type.toLowerCase()
+          : `${entry.columns?.length || 0} cols`,
+        owner: datasetName,
+      });
+    }
+    return out;
+  }
+
   function macroCandidates() {
     const projectMacros = (_catalog?.macros || []).map((name) => ({
       kind: 'item',
@@ -755,18 +796,26 @@ export function sqlEditor({ value = '', onRun, onChange, placeholder = '' } = {}
     let candidates = [];
 
     if (dot) {
-      /* `alias.` - restrict to that relation's columns where we can resolve it,
-         otherwise fall back to every reachable column. */
-      const all = await columnCandidates();
       const qualifier = dot.qualifier.toLowerCase();
-      const aliasMap = _aliasMap(textarea.value);
-      const targetOwner = (aliasMap.get(qualifier) || qualifier).toLowerCase();
 
-      const scoped = all.filter((item) => {
-        const owner = String(item.owner || '').toLowerCase();
-        return owner === targetOwner || owner.endsWith(`_${targetOwner}`);
-      });
-      candidates = scoped.length ? scoped : all;
+      /* `dataset.` -> the tables in that dataset, like BigQuery's console.
+         Checked first: a dataset qualifier is never a column owner, so there is
+         no ambiguity with the alias case below. */
+      if (isKnownDataset(qualifier)) {
+        candidates = await datasetTableCandidates(dot.qualifier);
+      } else {
+        /* `alias.` - restrict to that relation's columns where we can resolve
+           it, otherwise fall back to every reachable column. */
+        const all = await columnCandidates();
+        const aliasMap = _aliasMap(textarea.value);
+        const targetOwner = (aliasMap.get(qualifier) || qualifier).toLowerCase();
+
+        const scoped = all.filter((item) => {
+          const owner = String(item.owner || '').toLowerCase();
+          return owner === targetOwner || owner.endsWith(`_${targetOwner}`);
+        });
+        candidates = scoped.length ? scoped : all;
+      }
     } else {
       const columns = await columnCandidates();
       candidates = [
@@ -1170,7 +1219,12 @@ export function callout(title, body, kind = 'info', extra) {
   return el(
     `div.callout.${kind}`,
     el('span.callout-ico', icons[kind] || 'i'),
-    el('div', el('strong', title), body ? el('span', body) : null, extra ? el('div.mt', extra) : null),
+    el('div',
+      el('strong', title),
+      /* The body can be a long, unbreakable error string. Give it a class that
+         wraps and scrolls internally so nothing is clipped off the right edge. */
+      body ? el('span.callout-body', body) : null,
+      extra ? el('div.mt', extra) : null),
   );
 }
 

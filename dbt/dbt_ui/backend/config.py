@@ -8,8 +8,11 @@ profiles.yml so there is no second source of truth to keep in sync.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -167,6 +170,172 @@ def blocked_exclude_selectors() -> List[str]:
     return [f"tag:{layer}" for layer in blocked_build_layers()]
 
 
+# --------------------------------------------------------------------------
+# Runtime access settings
+#
+# The allowlist above is the built-in default. It can now also be managed from
+# the Settings screen, which persists the choice to dbt_ui/.runtime/access.json
+# so it survives a restart without anyone editing Python.
+#
+# Precedence, highest first:
+#   1. DBT_UI_ALLOWED_DATASETS   env var, an operator override nobody in the UI
+#                                can loosen
+#   2. access.json               what the Settings screen saved
+#   3. BASE_ALLOWED_DATASETS     the built-in default below
+# --------------------------------------------------------------------------
+
+ACCESS_FILE = "access.json"
+
+
+def _access_path() -> pathlib.Path:
+    return ensure_runtime_dir() / ACCESS_FILE
+
+
+def read_access_settings() -> Dict[str, Any]:
+    """The saved access settings, or an empty dict when nothing is saved."""
+    path = RUNTIME_DIR / ACCESS_FILE
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        # A corrupt settings file must not take the app down; fall back to the
+        # built-in default, which is the safer, narrower list.
+        return {}
+
+
+def write_access_settings(datasets: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Persist the project-wide dataset allowlist. Only the keys passed change.
+
+    A user's *role* does not live here - that is per-user in the users table.
+    Per-role *permission overrides* (which permission each role carries) do live
+    here, because they apply to the whole role, not one user. See
+    read_role_overrides / write_role_permission below.
+    """
+    current = read_access_settings()
+    current.pop("role", None)   # migrate away from the old single-role field
+
+    if datasets is not None:
+        cleaned = [str(name).strip().lower() for name in datasets if str(name).strip()]
+        current["datasets"] = list(dict.fromkeys(cleaned))
+
+    current["updated_at"] = time.time()
+    _access_path().write_text(json.dumps(current, indent=2), encoding="utf-8")
+    return current
+
+
+# --------------------------------------------------------------------------
+# Per-role permission overrides
+#
+# ROLES above is the built-in default matrix. The Settings screen can now flip
+# individual cells, and those changes are stored here so they survive a restart
+# and apply to every user holding that role. Overrides are merged *over* the
+# defaults, so anything left untouched keeps its built-in value and a future
+# change to the defaults still shows through for cells nobody overrode.
+# --------------------------------------------------------------------------
+
+# Permission keys that are never editable, with the value they are pinned to.
+# can_login stays on for every role: a role that cannot log in is a foot-gun
+# with no legitimate use here, and turning it off in the matrix would silently
+# lock people out.
+_PINNED_PERMISSIONS: Dict[str, bool] = {"can_login": True}
+
+
+def read_role_overrides() -> Dict[str, Dict[str, bool]]:
+    """Saved per-role permission overrides: {role: {perm_key: bool}}."""
+    data = read_access_settings().get("role_overrides")
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Dict[str, bool]] = {}
+    for role, perms in data.items():
+        if isinstance(perms, dict):
+            out[str(role).lower()] = {
+                str(k): bool(v) for k, v in perms.items()
+            }
+    return out
+
+
+def write_role_permission(role: str, permission: str, value: bool) -> Dict[str, Any]:
+    """
+    Persist one role/permission override and return the resulting role matrix.
+
+    Raises ValueError on an unknown role or permission, on an attempt to change
+    a pinned permission, and on a change that would leave no role able to modify
+    roles (which would make the matrix uneditable forever).
+    """
+    role = str(role).lower()
+    permission = str(permission)
+
+    if role not in ROLES:
+        raise ValueError(f"Unknown role '{role}'.")
+    valid_keys = {p["key"] for p in PERMISSIONS}
+    if permission not in valid_keys:
+        raise ValueError(f"Unknown permission '{permission}'.")
+    if permission in _PINNED_PERMISSIONS:
+        raise ValueError(
+            f"'{permission}' cannot be changed; every role keeps it."
+        )
+
+    value = bool(value)
+
+    # Guard: never let the last role that can modify roles lose that power, or
+    # nobody could ever edit the matrix again.
+    if permission == "can_modify_roles" and value is False:
+        still_able = [
+            r for r in ROLES
+            if (role_permissions(r)["can_modify_roles"] if r != role else False)
+        ]
+        if not still_able:
+            raise ValueError(
+                "At least one role must keep 'Modify user roles', otherwise the "
+                "matrix could never be edited again."
+            )
+
+    settings = read_access_settings()
+    overrides = settings.get("role_overrides")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    role_map = overrides.get(role)
+    if not isinstance(role_map, dict):
+        role_map = {}
+    role_map[permission] = value
+    overrides[role] = role_map
+    settings["role_overrides"] = overrides
+    settings["updated_at"] = time.time()
+    _access_path().write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    return role_catalogue()
+
+
+# --------------------------------------------------------------------------
+# Per-request user context
+#
+# warehouse.py enforces the dataset boundary deep inside its query paths, and
+# threading a user object through every one of those calls would touch a lot of
+# code for no benefit. The server is thread-per-request (ThreadingHTTPServer), so
+# a thread-local holds the authenticated user for the life of one request and
+# allowed_datasets() can consult it wherever it is called from.
+#
+# Set and cleared by the API layer around each request. If nothing is set - a CLI
+# call, a test, a background job - the project-wide allowlist applies unchanged.
+# --------------------------------------------------------------------------
+
+_request_ctx = threading.local()
+
+
+def set_request_user(user: Optional[Dict[str, Any]]) -> None:
+    _request_ctx.user = user
+
+
+def current_request_user() -> Optional[Dict[str, Any]]:
+    return getattr(_request_ctx, "user", None)
+
+
+def clear_request_user() -> None:
+    _request_ctx.user = None
+
+
 def allowed_datasets(target: Optional[str] = None) -> List[str]:
     """
     Resolve the dataset allowlist.
@@ -185,10 +354,38 @@ def allowed_datasets(target: Optional[str] = None) -> List[str]:
     seeds and the other 46 datasets are still refused - while removing a failure
     mode that had nothing to do with the boundary being enforced.
     """
+    names = _project_allowed_datasets()
+
+    # Narrow to the signed-in user's grants, when they have any. Intersection
+    # rather than replacement: a per-user grant can only ever restrict, never
+    # widen. Nobody can grant themselves a dataset the project boundary excludes.
+    user = current_request_user()
+    grants = [
+        str(name).strip().lower()
+        for name in ((user or {}).get("datasets") or [])
+        if str(name).strip()
+    ]
+    if grants:
+        allowed = set(names)
+        return [name for name in grants if name in allowed]
+
+    return names
+
+
+def _project_allowed_datasets() -> List[str]:
+    """The project-wide allowlist, before any per-user narrowing."""
     override = os.environ.get("DBT_UI_ALLOWED_DATASETS")
     if override:
         names = [part.strip().lower() for part in override.split(",") if part.strip()]
         return list(dict.fromkeys(names))
+
+    # What the Settings screen saved, if anything. This is an explicit choice by
+    # the operator, so it replaces the built-in list outright rather than being
+    # merged with it - otherwise unticking a default dataset could never take
+    # effect.
+    saved = read_access_settings().get("datasets")
+    if isinstance(saved, list) and saved:
+        return list(dict.fromkeys(str(n).strip().lower() for n in saved if str(n).strip()))
 
     names = [name.lower() for name in BASE_ALLOWED_DATASETS]
 
@@ -209,15 +406,168 @@ def dataset_allowed(dataset: str, target: Optional[str] = None) -> bool:
     return str(dataset or "").strip().lower() in set(allowed_datasets(target))
 
 
+# --------------------------------------------------------------------------
+# Roles
+#
+# The permission matrix, and nothing else. This module deliberately knows
+# nothing about sessions or users: which role is active is decided by the
+# authenticated user in the database (see auth.py), and the API layer resolves
+# it per request. Keeping the matrix pure means there is exactly one place to
+# read to know what a role may do.
+#
+# Note the shape of it. Manager is the privileged role, not Admin. Admin is a
+# broad *read and inspect* role: it can see every screen, including the database
+# configuration interfaces, but it cannot change tables, users, roles or
+# configuration. Only Manager can. That is unusual enough to be worth stating
+# out loud, because the names imply the opposite.
+#
+# These roles govern this application. They do not change what the underlying
+# Google credentials can reach - BigQuery IAM decides that, and a Manager here
+# cannot grant access the signed-in account does not already have.
+# --------------------------------------------------------------------------
+
+# The permissions the matrix is expressed in, in the order the UI shows them.
+PERMISSIONS: List[Dict[str, str]] = [
+    {"key": "can_login", "label": "Login"},
+    {"key": "can_view_studio", "label": "View Data Studio"},
+    {"key": "can_view_tables", "label": "View tables"},
+    {"key": "can_read_data", "label": "Read data"},
+    {"key": "can_view_config", "label": "View database configuration"},
+    {"key": "can_write_files", "label": "Modify tables"},
+    {"key": "can_manage_access", "label": "Manage user access"},
+    {"key": "can_modify_roles", "label": "Modify user roles"},
+    {"key": "can_configure", "label": "Configure database"},
+    {"key": "can_modify_datasets", "label": "Modify datasets"},
+    {"key": "can_run_dbt", "label": "Write/delete data (run dbt)"},
+]
+
+ROLES: Dict[str, Dict[str, Any]] = {
+    "admin": {
+        "label": "Admin",
+        "blurb": "Sees everything, changes nothing. Full visibility across Data "
+                 "Studio including the configuration screens, but no write, "
+                 "user-management or configuration rights.",
+        "can_login": True,
+        "can_view_studio": True,
+        "can_view_tables": True,
+        "can_read_data": True,
+        "can_view_config": True,
+        "can_write_files": False,
+        "can_manage_access": False,
+        "can_modify_roles": False,
+        "can_configure": False,
+        "can_modify_datasets": False,
+        "can_run_dbt": False,
+    },
+    "manager": {
+        "label": "Manager",
+        "blurb": "The privileged role. Modifies tables, manages users, roles and "
+                 "dataset access, and configures the database.",
+        "can_login": True,
+        "can_view_studio": True,
+        "can_view_tables": True,
+        "can_read_data": True,
+        "can_view_config": True,
+        "can_write_files": True,
+        "can_manage_access": True,
+        "can_modify_roles": True,
+        "can_configure": True,
+        "can_modify_datasets": True,
+        "can_run_dbt": True,
+    },
+    "analyst": {
+        "label": "Analyst",
+        "blurb": "Read only. Views the datasets and tables they have been granted, "
+                 "their schemas and documentation, and queries data. No writes of "
+                 "any kind.",
+        "can_login": True,
+        "can_view_studio": True,
+        "can_view_tables": True,
+        "can_read_data": True,
+        "can_view_config": False,
+        "can_write_files": False,
+        "can_manage_access": False,
+        "can_modify_roles": False,
+        "can_configure": False,
+        "can_modify_datasets": False,
+        "can_run_dbt": False,
+    },
+}
+
+# Used only when describing the matrix to an unauthenticated caller. Nothing is
+# authorized against this - an unauthenticated request is refused outright.
+FALLBACK_ROLE = "analyst"
+
+
+def role_permissions(role: Optional[str] = None) -> Dict[str, Any]:
+    """
+    The permission set for a role name, with any saved overrides applied.
+
+    Unknown or missing roles collapse to the least privileged entry rather than
+    the most privileged one, so a typo or a corrupt row fails closed. Saved
+    overrides from the Settings matrix are merged over the built-in defaults;
+    pinned permissions (can_login) always win regardless of what was saved.
+    """
+    name = str(role or FALLBACK_ROLE).lower()
+    resolved = name if name in ROLES else FALLBACK_ROLE
+    meta = dict(ROLES[resolved])
+
+    override = read_role_overrides().get(resolved) or {}
+    valid_keys = {p["key"] for p in PERMISSIONS}
+    for key, value in override.items():
+        if key in valid_keys and key not in _PINNED_PERMISSIONS:
+            meta[key] = bool(value)
+    for key, value in _PINNED_PERMISSIONS.items():
+        meta[key] = value
+
+    meta["role"] = resolved
+    return meta
+
+
+def role_catalogue() -> Dict[str, Any]:
+    """The whole matrix, for the UI to render and explain. Reflects overrides."""
+    overrides = read_role_overrides()
+    return {
+        "permissions": PERMISSIONS,
+        # Non-editable permission keys, so the UI can show them as locked.
+        "pinned": list(_PINNED_PERMISSIONS.keys()),
+        "roles": [
+            {"key": key, **role_permissions(key)}
+            for key in ROLES
+        ],
+        "customised": bool(overrides),
+        "note": (
+            "Manager is the privileged role. Admin has full visibility but no "
+            "write, user-management or configuration rights. These roles govern "
+            "this application only; BigQuery IAM still decides what the "
+            "underlying credentials can reach."
+        ),
+    }
+
+
 def scope_description(target: Optional[str] = None) -> Dict[str, Any]:
     """Everything the UI needs to explain the boundary to the user."""
     names = allowed_datasets(target)
+    project_names = _project_allowed_datasets()
     blocked = blocked_build_layers()
+    saved = read_access_settings().get("datasets")
+    env_override = bool(os.environ.get("DBT_UI_ALLOWED_DATASETS"))
+    user = current_request_user()
+    user_grants = [n for n in ((user or {}).get("datasets") or [])]
     return {
         "allowed_datasets": names,
+        "project_datasets": project_names,
+        "user_restricted": bool(user_grants),
         "layers": [layer for layer in ALLOWED_LAYERS],
         "blocked_layers": blocked,
-        "overridden": bool(os.environ.get("DBT_UI_ALLOWED_DATASETS")),
+        "overridden": env_override,
+        "source": (
+            "user" if user_grants
+            else "environment" if env_override
+            else "settings" if isinstance(saved, list) and saved
+            else "default"
+        ),
+        "env_locked": env_override,
         "summary": (
             f"Read access is limited to {len(names)} dataset"
             f"{'' if len(names) == 1 else 's'}: {', '.join(names)}."

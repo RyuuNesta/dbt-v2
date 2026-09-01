@@ -443,7 +443,7 @@ export function tablePicker({
     el(
       'div.row.wrap.between.mb',
       { style: { gap: '10px' } },
-      el('div.stat-label', title),
+      el('div.stat-label', title || 'Tables'),
       el(
         'div.row',
         { style: { gap: '6px' } },

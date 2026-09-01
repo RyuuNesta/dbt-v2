@@ -1,0 +1,102 @@
+version: 2
+
+models:
+  - name: my_new_model
+    description: TODO describe my new model.
+
+    columns:
+      - name: category
+        data_type: string
+        description: TODO describe category. Text value.
+
+      - name: Journal_Entry
+        data_type: string
+        description: TODO describe Journal Entry. Text value.
+
+      - name: Journal_Entry_Item_Text
+        data_type: string
+        description: TODO describe Journal Entry Item Text. Text value.
+
+      - name: posting_date
+        data_type: date
+        description: Date the document was posted to the ledger.
+
+      - name: amount
+        data_type: numeric
+        description: Monetary amount.
+
+      - name: Profit_Center
+        data_type: string
+        description: TODO describe Profit Center. Text value.
+
+      - name: Company_Code
+        data_type: string
+        description: Company code identifying the legal entity.
+
+      - name: Segment
+        data_type: string
+        description: TODO describe Segment. Text value.
+
+      - name: Company_Code_Name
+        data_type: string
+        description: Company code identifying the legal entity.
+
+      - name: SAPnonSAP
+        data_type: string
+        description: TODO describe SAPnonSAP. Text value.
+
+      - name: Group
+        data_type: string
+        description: TODO describe Group. Text value.
+
+      - name: pc_segment
+        data_type: string
+        description: TODO describe pc segment. Text value.
+
+      - name: Segment_Name
+        data_type: string
+        description: Human-readable name.
+
+      - name: Description_Project
+        data_type: string
+        description: TODO describe Description Project. Text value.
+
+      - name: pc_category
+        data_type: string
+        description: TODO describe pc category. Text value.
+
+      - name: Level_1
+        data_type: string
+        description: TODO describe Level 1. Text value.
+
+      - name: Level_2
+        data_type: string
+        description: TODO describe Level 2. Text value.
+
+      - name: Level_3
+        data_type: string
+        description: TODO describe Level 3. Text value.
+
+      - name: COA_Name_Level_4
+        data_type: string
+        description: TODO describe COA Name Level 4. Text value.
+
+      - name: SAP_Account_Group_Code
+        data_type: int64
+        description: TODO describe SAP Account Group Code. Numeric measure.
+
+      - name: SAP_Account_Group
+        data_type: string
+        description: TODO describe SAP Account Group. Text value.
+
+      - name: COA_No
+        data_type: int64
+        description: TODO describe COA No. Numeric measure.
+
+      - name: coa_category
+        data_type: string
+        description: TODO describe coa category. Text value.
+
+      - name: Workspace_analytic
+        data_type: string
+        description: TODO describe Workspace analytic. Text value.

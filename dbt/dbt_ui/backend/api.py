@@ -8,6 +8,8 @@ layer knows nothing about sockets.
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import pathlib
 import re
@@ -16,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import (
     ai_docs,
+    auth,
     codegen,
     config,
     erd as erd_mod,
@@ -50,11 +53,27 @@ class ApiError(Exception):
 
 class Request:
     def __init__(self, method: str, path: str,
-                 query: Dict[str, List[str]], body: Dict[str, Any]):
+                 query: Dict[str, List[str]], body: Dict[str, Any],
+                 headers: Optional[Dict[str, str]] = None):
         self.method = method
         self.path = path
         self.query = query
         self.body = body if isinstance(body, dict) else {}
+        self.headers = headers or {}
+        # Populated by the auth gate in handle(). None only on the routes that
+        # are reachable without signing in.
+        self.user: Optional[Dict[str, Any]] = None
+        # Response headers a handler wants set, e.g. Set-Cookie on login.
+        self.response_headers: Dict[str, str] = {}
+
+    @property
+    def session_token(self) -> Optional[str]:
+        cookies = auth.parse_cookies(self.headers.get("cookie"))
+        return cookies.get(auth.COOKIE_NAME)
+
+    @property
+    def permissions(self) -> Dict[str, Any]:
+        return config.role_permissions((self.user or {}).get("role"))
 
     # ------------------------------------------------------------------
 
@@ -192,6 +211,11 @@ def _bootstrap(request: Request) -> Tuple[int, Any]:
         "docs_available": (config.TARGET_DIR / "static_index.html").exists(),
         "ai": ai_docs.status(),
         "scope": config.scope_description(),
+        # Who is signed in and what they may do. The frontend uses this to shape
+        # the UI; the backend enforces the same matrix independently.
+        "user": config.current_request_user(),
+        "permissions": request.permissions,
+        "roles": config.role_catalogue(),
         "manifest_target": mf.built_with_target() if mf else None,
     }
     return 200, payload
@@ -265,6 +289,33 @@ def _model_detail(request: Request) -> Tuple[int, Any]:
     if detail is None:
         raise ApiError(f"No model or seed named '{name}' in this project.", 404)
     return 200, {"model": detail}
+
+
+@ROUTER.get("/api/docs/site")
+def _docs_site(request: Request) -> Tuple[int, Any]:
+    """
+    Status of the dbt-generated documentation site.
+
+    The site is a single self-contained file that `dbt docs generate --static`
+    writes to target/static_index.html and the server exposes at /dbt-docs. This
+    reports whether it exists and how fresh it is, so the UI can say "generated
+    3 hours ago" and offer to regenerate rather than guessing.
+    """
+    static_index = config.TARGET_DIR / "static_index.html"
+    catalog = config.CATALOG_PATH
+    exists = static_index.is_file()
+    return 200, {
+        "available": exists,
+        "url": "/dbt-docs",
+        "generated_at": (static_index.stat().st_mtime if exists else None),
+        "size_bytes": (static_index.stat().st_size if exists else 0),
+        "has_catalog": catalog.is_file(),
+        "catalog_at": (catalog.stat().st_mtime if catalog.is_file() else None),
+        # dbt docs generate is a dbt command, so running it needs the same
+        # permission as any other run. The UI uses this to decide whether to
+        # show the button enabled.
+        "can_generate": request.permissions.get("can_run_dbt", False),
+    }
 
 
 @ROUTER.get("/api/sources")
@@ -535,10 +586,26 @@ def _query_run(request: Request) -> Tuple[int, Any]:
     if not ok:
         raise ApiError(reason, status=400, stage="policy")
 
-    executed = jinja_sql.wrap_with_limit(compiled["compiled_sql"], limit)
+    # CREATE VIEW / CREATE TABLE return no rows, so wrapping them in a
+    # `select * from (...) limit N` would be a syntax error. Run the DDL
+    # verbatim and skip the row cap.
+    is_ddl = jinja_sql.is_create_ddl(compiled["compiled_sql"])
+    is_table = jinja_sql.is_table_ddl(compiled["compiled_sql"])
+
+    # Creating a view or a table is a write, not a read. Reading is open to every
+    # role; this is not. Checked after compilation so the message names the
+    # statement type rather than refusing anything that merely looks like DDL.
+    if is_ddl:
+        _require("can_write_files",
+                 "create tables or views (this statement is DDL, not a query)")
+    executed = (
+        compiled["compiled_sql"]
+        if is_ddl
+        else jinja_sql.wrap_with_limit(compiled["compiled_sql"], limit)
+    )
     try:
         result = warehouse.execute(
-            executed, target=request.target, limit=limit, apply_limit=True
+            executed, target=request.target, limit=limit, apply_limit=not is_ddl
         )
     except warehouse.WarehouseError as exc:
         raise _warehouse_failure(exc, sql=executed) from exc
@@ -547,6 +614,8 @@ def _query_run(request: Request) -> Tuple[int, Any]:
         "compiled": compiled,
         "result": result.to_dict(),
         "yaml": codegen.columns_yaml_fragment(result.columns),
+        "ddl": is_ddl,
+        "ddl_kind": "table" if is_table else ("view" if is_ddl else None),
     }
 
 
@@ -764,10 +833,10 @@ def _schema_generate(request: Request) -> Tuple[int, Any]:
             }
             if ai_result else None
         ),
-        "columns": [
+        "columns": _blank_if_undocumented([
             _column_payload(c, profiles, existing, ai_descriptions)
             for c in typing_map.flatten_columns(columns)
-        ],
+        ], include_descriptions),
         "yaml": generated["yaml"],
         "fragment": codegen.columns_yaml_fragment(columns),
         "markdown": codegen.markdown_table(columns, profiles),
@@ -779,6 +848,251 @@ def _schema_generate(request: Request) -> Tuple[int, Any]:
         "table": described,
         "suggested_path": _suggested_yaml_path(node, name),
     }
+
+
+@ROUTER.post("/api/schema/rebuild")
+def _schema_rebuild(request: Request) -> Tuple[int, Any]:
+    """
+    Re-render the schema YAML from columns already produced by /generate, with
+    the descriptions the user edited in the proposal.
+
+    This never touches the warehouse: the caller already has the column shapes
+    and profiles from the generate step, so editing a description and seeing the
+    YAML update is instant. Edited descriptions are passed as `ai_descriptions`
+    because those take top precedence in codegen.schema_yaml, which is exactly
+    the "the human overrode the draft" semantics we want.
+    """
+    name = str(request.need("name"))
+    columns = request.need("columns")
+    if not isinstance(columns, list):
+        raise ApiError("'columns' must be a list of column objects.")
+
+    descriptions = request.opt("descriptions", {}) or {}
+    if not isinstance(descriptions, dict):
+        raise ApiError("'descriptions' must be a name -> text mapping.")
+
+    profiles = request.opt("profiles", {}) or {}
+    resource_type = str(request.opt("resource_type", "model"))
+    description = str(request.opt("description", ""))
+    materialized = str(request.opt("materialized", ""))
+    include_tests = bool(request.opt("include_tests", True))
+    include_descriptions = bool(request.opt("include_descriptions", True))
+
+    generated = codegen.schema_yaml(
+        name=name,
+        columns=columns,
+        resource_type=resource_type,
+        description=description,
+        profiles=profiles,
+        include_tests=include_tests,
+        include_descriptions=include_descriptions,
+        materialized=materialized,
+        # Edited text wins over any drafted description.
+        ai_descriptions={k: v for k, v in descriptions.items() if str(v).strip()},
+    )
+
+    return 200, {
+        "name": name,
+        "yaml": generated["yaml"],
+        "markdown": codegen.markdown_table(columns, profiles),
+        "stats": {
+            "column_count": generated["column_count"],
+            "documented": generated["documented"],
+            "needs_review": generated["needs_review"],
+        },
+    }
+
+
+@ROUTER.post("/api/schema/source")
+def _schema_source(request: Request) -> Tuple[int, Any]:
+    """
+    Declare a table dbt does not build as a dbt source.
+
+    Reads the physical table's schema from BigQuery (the free get_table
+    metadata call), drafts descriptions the same way the model generator does
+    (pattern rules by default, Gemini when engine=ai), and returns a dbt
+    `sources:` block. Writing that block and re-parsing is what makes dbt aware
+    of the table: it then appears in dbt docs, gets lineage, and can be
+    source()-referenced.
+
+    Input is a fully-qualified relation, e.g. bronze_dbt.bronze_workspace or
+    project.bronze_dbt.bronze_workspace. The dataset must be in scope.
+    """
+    raw = str(request.need("relation")).strip().replace("`", "")
+    include_profile = bool(request.opt("profile", False))
+    include_tests = bool(request.opt("include_tests", True))
+    include_descriptions = bool(request.opt("include_descriptions", True))
+
+    # Normalise to project.dataset.table. A two-part dataset.table gets the
+    # target's project prepended so describe_relation can resolve it.
+    parts = [p for p in raw.split(".") if p]
+    cfg = config.target_config(request.target)
+    project = str(cfg.get("project") or "")
+    if len(parts) == 2:
+        dataset, table = parts
+    elif len(parts) == 3:
+        project, dataset, table = parts
+    else:
+        raise ApiError(
+            "Give the table as dataset.table (or project.dataset.table), for "
+            "example bronze_dbt.bronze_workspace_analytics_combined.",
+            status=400,
+        )
+
+    relation = f"{project}.{dataset}.{table}"
+    _guard_relation(relation, request.target, label=relation)
+
+    try:
+        described = warehouse.describe_relation(relation, target=request.target)
+    except warehouse.WarehouseError as exc:
+        raise _warehouse_failure(exc) from exc
+
+    columns = described["columns"]
+    # A readable default source name: the dataset it lives in.
+    source_name = str(request.opt("source_name") or dataset)
+    description = str(request.opt("description") or "")
+
+    profiles: Dict[str, Dict[str, Any]] = {}
+    if include_profile:
+        profile = profiling.profile_relation(
+            relation, target=request.target,
+            sample_rows=config.SETTINGS.profile_sample_rows,
+        )
+        for col in profile["columns"]:
+            profiles[col["name"]] = col
+        _attach_top_values(profiles, relation, request.target)
+
+    # ---- descriptions: pattern rules, or Gemini --------------------------
+    engine = str(request.opt("engine", "pattern")).lower()
+    ai_result: Optional[Dict[str, Any]] = None
+    ai_descriptions: Dict[str, str] = {}
+
+    if engine == "ai" and include_descriptions:
+        flat_columns = typing_map.flatten_columns(columns)
+        try:
+            ai_result = ai_docs.describe_columns(
+                table_name=table,
+                columns=flat_columns,
+                profiles=profiles,
+                model=str(request.opt("ai_model", ai_docs.DEFAULT_MODEL)),
+                layer="",
+                row_count=described.get("row_count"),
+                existing_description=description,
+                upstream=[],
+                send_sample_values=bool(request.opt("send_sample_values", False)),
+            )
+        except ai_docs.AiError as exc:
+            payload = exc.to_dict()
+            payload["engine"] = "ai"
+            raise ApiError(exc.message, status=502, **{
+                k: v for k, v in payload.items() if k != "error"
+            }) from exc
+        ai_descriptions = ai_result["descriptions"]
+        if ai_result.get("table_description") and not description:
+            description = ai_result["table_description"]
+
+    generated = codegen.source_yaml(
+        source_name=source_name,
+        database=project,
+        schema=dataset,
+        table=table,
+        columns=columns,
+        table_description=description,
+        profiles=profiles,
+        include_tests=include_tests,
+        include_descriptions=include_descriptions,
+        ai_descriptions=ai_descriptions,
+    )
+
+    return 200, {
+        "name": table,
+        "source_name": source_name,
+        "database": project,
+        "schema": dataset,
+        "relation": relation,
+        "reference": generated["reference"],
+        "engine": engine,
+        "ai": (
+            {k: v for k, v in ai_result.items() if k != "descriptions"}
+            if ai_result else None
+        ),
+        "columns": _blank_if_undocumented([
+            _column_payload(c, profiles, {}, ai_descriptions)
+            for c in typing_map.flatten_columns(columns)
+        ], include_descriptions),
+        "yaml": generated["yaml"],
+        "markdown": codegen.markdown_table(columns, profiles),
+        "stats": {
+            "column_count": generated["column_count"],
+            "documented": generated["documented"],
+            "needs_review": generated["needs_review"],
+        },
+        # Where the block should be written. A shared sources file per project.
+        "suggested_path": "models/_sources.yml",
+        "table": described,
+    }
+
+
+@ROUTER.post("/api/schema/source/rebuild")
+def _schema_source_rebuild(request: Request) -> Tuple[int, Any]:
+    """
+    Re-render the source YAML from edited descriptions, no warehouse call.
+
+    The companion to /api/schema/rebuild, for the source declaration flow: the
+    caller already holds the columns and profiles, so editing a description and
+    seeing the YAML update is instant.
+    """
+    source_name = str(request.need("source_name"))
+    database = str(request.need("database"))
+    schema = str(request.need("schema"))
+    table = str(request.need("table"))
+    columns = request.need("columns")
+    if not isinstance(columns, list):
+        raise ApiError("'columns' must be a list of column objects.")
+
+    descriptions = request.opt("descriptions", {}) or {}
+    profiles = request.opt("profiles", {}) or {}
+
+    generated = codegen.source_yaml(
+        source_name=source_name,
+        database=database,
+        schema=schema,
+        table=table,
+        columns=columns,
+        table_description=str(request.opt("description", "")),
+        profiles=profiles,
+        include_tests=bool(request.opt("include_tests", True)),
+        include_descriptions=bool(request.opt("include_descriptions", True)),
+        ai_descriptions={k: v for k, v in descriptions.items() if str(v).strip()},
+    )
+    return 200, {
+        "name": table,
+        "yaml": generated["yaml"],
+        "markdown": codegen.markdown_table(columns, profiles),
+        "reference": generated["reference"],
+        "stats": {
+            "column_count": generated["column_count"],
+            "documented": generated["documented"],
+            "needs_review": generated["needs_review"],
+        },
+    }
+
+
+def _blank_if_undocumented(columns: List[Dict[str, Any]],
+                           include_descriptions: bool) -> List[Dict[str, Any]]:
+    """
+    When the caller asked for no descriptions (the 'None' engine), the editable
+    proposal should open blank rather than pre-filled with pattern drafts. The
+    YAML already omits them; this keeps the on-screen table consistent so the
+    user is starting from a clean slate to type their own.
+    """
+    if include_descriptions:
+        return columns
+    for column in columns:
+        column["description"] = ""
+        column["needs_review"] = False
+        column["description_source"] = "none"
+    return columns
 
 
 def _column_payload(
@@ -924,25 +1238,27 @@ def _advisor_analyse(request: Request) -> Tuple[int, Any]:
     return 200, analysis
 
 
-def _advisor_context(request: Request) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+def _advisor_context(
+    request: Request,
+) -> Tuple[str, str, Dict[str, Any], Dict[str, Any]]:
     """
-    Re-profile a source model and rebuild its analysis.
+    Re-profile a source (model or raw relation) and rebuild its analysis.
+
+    Returns (source_model, relation, analysis, profile). source_model is empty
+    for a foreign table; relation is always the physical relation that was
+    profiled.
 
     Shared by the preview and the generator so the two can never disagree about
     what the recommendations are. Both re-measure rather than trusting a payload
     posted back by the browser: the accepted *ids* come from the client, the
     facts behind them do not.
     """
-    source_model = str(request.need("model"))
+    # Accept either a dbt model or a raw relation, exactly like /analyse. A
+    # foreign table has no model name; silver generation then reads the table by
+    # its physical relation instead of ref().
+    relation, node = _resolve_relation(request)
+    source_model = str((node or {}).get("name") or "")
 
-    mf = _manifest()
-    node = mf.node_detail(source_model)
-    if node is None:
-        raise ApiError(f"No model named '{source_model}'.", 404)
-    if not node.get("relation_name"):
-        raise ApiError(f"Build '{source_model}' before generating from it.")
-
-    relation = str(node["relation_name"])
     try:
         profile = profiling.profile_relation(
             relation, target=request.target,
@@ -968,7 +1284,7 @@ def _advisor_context(request: Request) -> Tuple[str, Dict[str, Any], Dict[str, A
     # silver_plan reads the duplicate check to estimate the output row count,
     # and analyse() does not put it on the result.
     analysis["duplicate_check"] = duplicate
-    return source_model, analysis, profile
+    return source_model, relation, analysis, profile
 
 
 @ROUTER.post("/api/advisor/preview")
@@ -979,9 +1295,10 @@ def _advisor_preview(request: Request) -> Tuple[int, Any]:
     Nothing here writes, and nothing here queries the warehouse beyond the
     profile the analysis needs anyway.
     """
-    source_model, analysis, profile = _advisor_context(request)
+    source_model, relation, analysis, profile = _advisor_context(request)
     plan = codegen.silver_plan(
         source_model=source_model,
+        source_relation=relation,
         analysis=analysis,
         profile=profile,
         accepted_ids=request.opt("accepted_ids"),
@@ -994,9 +1311,10 @@ def _advisor_preview(request: Request) -> Tuple[int, Any]:
 @ROUTER.post("/api/advisor/generate")
 def _advisor_generate(request: Request) -> Tuple[int, Any]:
     """Turn the accepted recommendations into a silver model."""
-    source_model, analysis, profile = _advisor_context(request)
+    source_model, relation, analysis, profile = _advisor_context(request)
     generated = codegen.silver_model(
         source_model=source_model,
+        source_relation=relation,
         analysis=analysis,
         profile=profile,
         accepted_ids=request.opt("accepted_ids"),
@@ -1009,6 +1327,89 @@ def _advisor_generate(request: Request) -> Tuple[int, Any]:
 # --------------------------------------------------------------------------
 # warehouse browsing
 # --------------------------------------------------------------------------
+
+@ROUTER.get("/api/access/settings")
+def _access_settings(request: Request) -> Tuple[int, Any]:
+    """
+    Every dataset the credentials can see, flagged with whether the UI is
+    currently allowed to use it.
+
+    This is what makes the boundary configurable instead of hardcoded: the list
+    comes from BigQuery, the ticks come from the saved settings, and saving
+    writes them back to dbt_ui/.runtime/access.json.
+    """
+    target = request.q("target")
+    allowed = set(config.allowed_datasets(target))
+
+    visible: List[Dict[str, Any]] = []
+    error: Optional[str] = None
+    try:
+        # all_datasets bypasses the allowlist on purpose: you cannot tick a
+        # dataset you are not allowed to see in the picker.
+        for entry in warehouse.list_all_datasets(target):
+            name = str(entry.get("dataset_id") or "")
+            visible.append({
+                "dataset": name,
+                "location": entry.get("location"),
+                "allowed": name.lower() in allowed,
+            })
+    except warehouse.WarehouseError as exc:
+        error = exc.message
+
+    # A dataset can be allowed but no longer exist (renamed, dropped, or the
+    # credentials lost sight of it). Surface those rather than dropping them
+    # silently, so the saved list can be cleaned up.
+    seen = {d["dataset"].lower() for d in visible}
+    missing = sorted(name for name in allowed if name not in seen)
+
+    return 200, {
+        "datasets": sorted(visible, key=lambda d: d["dataset"].lower()),
+        "missing": missing,
+        "scope": config.scope_description(target),
+        "user": config.current_request_user(),
+        "permissions": request.permissions,
+        "error": error,
+    }
+
+
+@ROUTER.post("/api/access/settings")
+def _access_settings_save(request: Request) -> Tuple[int, Any]:
+    """
+    Persist the project-wide dataset allowlist.
+
+    Roles are not settable here any more: they are per-user and live in the
+    users table. See /api/users/role.
+    """
+    _require("can_modify_datasets", "change dataset access")
+
+    datasets = request.opt("datasets")
+    if datasets is None:
+        raise ApiError("Provide 'datasets'.")
+    if not isinstance(datasets, list):
+        raise ApiError("'datasets' must be a list of dataset names.")
+    if os.environ.get("DBT_UI_ALLOWED_DATASETS"):
+        raise ApiError(
+            "DBT_UI_ALLOWED_DATASETS is set in the environment, which takes "
+            "precedence. Unset it to manage access from here.",
+            status=409,
+        )
+
+    config.write_access_settings(datasets=list(datasets))
+
+    # The allowlist feeds cached warehouse metadata, so those caches are now
+    # stale in both directions (a newly allowed dataset was never fetched, a
+    # revoked one must stop being served).
+    warehouse.clear_schema_cache()
+    warehouse.clear_inventory_cache()
+    manifest_mod.invalidate()
+
+    target = request.q("target")
+    return 200, {
+        "saved": True,
+        "scope": config.scope_description(target),
+        "note": "Reload the project so every screen picks up the new boundary.",
+    }
+
 
 @ROUTER.get("/api/warehouse/datasets")
 def _datasets(request: Request) -> Tuple[int, Any]:
@@ -1066,6 +1467,7 @@ def _schedules_list(request: Request) -> Tuple[int, Any]:
 @ROUTER.post("/api/schedules")
 def _schedules_save(request: Request) -> Tuple[int, Any]:
     """Create or update a schedule. Does not register it with Windows."""
+    _require("can_configure", "create or change schedules")
     try:
         record = schedules.save(dict(request.body or {}))
     except schedules.ScheduleError as exc:
@@ -1082,6 +1484,7 @@ def _schedules_save(request: Request) -> Tuple[int, Any]:
 
 @ROUTER.post("/api/schedules/delete")
 def _schedules_delete(request: Request) -> Tuple[int, Any]:
+    _require("can_configure", "delete schedules")
     schedule_id = str(request.need("id"))
     removed = schedules.delete(schedule_id)
     if not removed:
@@ -1097,6 +1500,7 @@ def _schedules_register(request: Request) -> Tuple[int, Any]:
     Kept as an explicit action rather than folded into save: this is the moment
     dbt gains the ability to run against a real warehouse with nobody watching.
     """
+    _require("can_configure", "register scheduled runs")
     schedule_id = str(request.need("id"))
     record = schedules.get_schedule(schedule_id)
     if record is None:
@@ -1272,6 +1676,8 @@ def _preview(request: Request) -> Tuple[int, Any]:
 
 @ROUTER.post("/api/dbt/run")
 def _dbt_run(request: Request) -> Tuple[int, Any]:
+    _require("can_run_dbt", "run dbt commands")
+
     command = str(request.need("command"))
     if command not in runner.ALLOWED_COMMANDS:
         raise ApiError(
@@ -1356,6 +1762,7 @@ def _dbt_job(request: Request) -> Tuple[int, Any]:
 
 @ROUTER.post("/api/dbt/jobs/<job_id>/cancel")
 def _dbt_cancel(request: Request) -> Tuple[int, Any]:
+    _require("can_run_dbt", "cancel dbt runs")
     job_id = str(request.body.get("job_id"))
     if not runner.cancel(job_id):
         raise ApiError("That job is not running, so there is nothing to cancel.")
@@ -1449,6 +1856,8 @@ def _docs_patch(request: Request) -> Tuple[int, Any]:
     survive byte for byte, and the patcher refuses to write if a structural
     comparison shows anything else changed.
     """
+    _require("can_write_files", "edit documentation")
+
     name = str(request.need("model"))
     path = _schema_path_for(name)
 
@@ -1508,9 +1917,9 @@ def _docs_export(request: Request) -> Tuple[int, Any]:
     """
     The committed documentation in a downloadable shape.
 
-    Returns all three formats in one response so the client can offer .yml,
-    .json and .md without three round trips. The .yml is the file exactly as it
-    is on disk, so a download always matches what dbt would read.
+    Returns every format in one response so the client can offer .yml, .json,
+    .md and .csv without four round trips. The .yml is the file exactly as it is
+    on disk, so a download always matches what dbt would read.
     """
     name = request.q("model")
     if not name:
@@ -1547,6 +1956,22 @@ def _docs_export(request: Request) -> Tuple[int, Any]:
         f"## Columns\n\n" + "\n".join(markdown_rows) + "\n"
     )
 
+    # CSV for the people who want the documentation in a spreadsheet. Written
+    # here rather than in the browser so every export format comes from the same
+    # parsed file and cannot drift. RFC 4180 quoting via the csv module.
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer, lineterminator="\n")
+    writer.writerow(["model", "model_description", "column", "data_type",
+                     "description"])
+    for column in columns:
+        writer.writerow([
+            doc.name,
+            doc.description or "",
+            column["name"],
+            (column["data_type"] or "").lower(),
+            column["description"] or "",
+        ])
+
     return 200, {
         "model": doc.name,
         "path": str(path.relative_to(config.PROJECT_DIR)).replace("\\", "/"),
@@ -1558,6 +1983,7 @@ def _docs_export(request: Request) -> Tuple[int, Any]:
             "columns": columns,
         },
         "markdown": markdown,
+        "csv": csv_buffer.getvalue(),
     }
 
 
@@ -1579,6 +2005,7 @@ def _ai_key(request: Request) -> Tuple[int, Any]:
     The key is only ever written to dbt_ui/.runtime/ai.json (gitignored) and is
     never returned to the browser except as a masked prefix.
     """
+    _require("can_configure", "change the API key")
     action = str(request.opt("action", "save")).lower()
 
     try:
@@ -1596,6 +2023,7 @@ def _ai_key(request: Request) -> Tuple[int, Any]:
 @ROUTER.post("/api/manifest/refresh")
 def _manifest_refresh(request: Request) -> Tuple[int, Any]:
     """Run dbt parse to rebuild the manifest."""
+    _require("can_run_dbt", "run dbt parse")
     manifest_mod.invalidate()
     try:
         job = runner.launch("parse", target=request.target)
@@ -1609,6 +2037,278 @@ def _manifest_refresh(request: Request) -> Tuple[int, Any]:
 # --------------------------------------------------------------------------
 
 WRITABLE_SUFFIXES = {".sql", ".yml", ".yaml", ".md", ".csv"}
+
+
+def _require(permission: str, what: str) -> None:
+    """
+    Refuse an action the signed-in user's role does not carry.
+
+    This is the real enforcement point, not a UI convenience. Hiding a button in
+    the frontend stops an honest mistake; this stops a hand-rolled curl. The role
+    comes from the users table via the per-request context, so a role change
+    takes effect on the very next request even for an existing session.
+    """
+    user = config.current_request_user()
+    if user is None:
+        raise ApiError("Sign in to do that.", status=401, unauthenticated=True)
+
+    perms = config.role_permissions(user.get("role"))
+    if perms.get(permission):
+        return
+    raise ApiError(
+        f"The {perms.get('label')} role cannot {what}.",
+        status=403,
+        role=perms.get("role"),
+        needed=permission,
+    )
+
+
+# --------------------------------------------------------------------------
+# authentication
+#
+# Every /api route requires a valid session except the few listed here: the
+# login endpoint itself, the health probe, and the role matrix (which the login
+# screen shows before anyone has signed in). Everything else is refused with 401
+# so the frontend can send the user to the login screen.
+# --------------------------------------------------------------------------
+
+PUBLIC_ROUTES = frozenset({
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/session",
+    "/api/auth/roles",
+})
+
+
+@ROUTER.post("/api/auth/login")
+def _auth_login(request: Request) -> Tuple[int, Any]:
+    """Exchange email and password for a session cookie."""
+    email = str(request.need("email"))
+    password = str(request.need("password"))
+
+    try:
+        token, user = auth.login(email, password)
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+
+    request.response_headers["Set-Cookie"] = auth.session_cookie(token)
+    return 200, {
+        "user": user,
+        "permissions": config.role_permissions(user["role"]),
+    }
+
+
+@ROUTER.post("/api/auth/logout")
+def _auth_logout(request: Request) -> Tuple[int, Any]:
+    auth.logout(request.session_token)
+    request.response_headers["Set-Cookie"] = auth.clear_cookie()
+    return 200, {"ok": True}
+
+
+@ROUTER.get("/api/auth/session")
+def _auth_session(request: Request) -> Tuple[int, Any]:
+    """
+    Who am I? Public on purpose: the frontend calls this on load to decide
+    between the app and the login screen, and it must not 401-loop.
+    """
+    user = auth.resolve_session(request.session_token)
+    if user is None:
+        return 200, {"authenticated": False}
+    return 200, {
+        "authenticated": True,
+        "user": user,
+        "permissions": config.role_permissions(user["role"]),
+    }
+
+
+@ROUTER.get("/api/auth/roles")
+def _auth_roles(request: Request) -> Tuple[int, Any]:
+    """The permission matrix. Read-only reference, safe to show pre-login."""
+    return 200, config.role_catalogue()
+
+
+@ROUTER.post("/api/roles/permission")
+def _role_permission(request: Request) -> Tuple[int, Any]:
+    """
+    Flip one cell of the permission matrix: role + permission -> true/false.
+
+    Manager-only (can_modify_roles). Persisted as an override merged over the
+    built-in defaults, so it survives a restart and applies to every user
+    holding that role on their next request. Guardrails in config reject pinned
+    permissions and any change that would leave no role able to edit the matrix.
+    """
+    _require("can_modify_roles", "change role permissions")
+
+    role = str(request.need("role"))
+    permission = str(request.need("permission"))
+    value = bool(request.opt("value", False))
+
+    try:
+        catalogue = config.write_role_permission(role, permission, value)
+    except ValueError as exc:
+        raise ApiError(str(exc), status=409) from exc
+
+    return 200, {
+        "saved": True,
+        "roles": catalogue,
+        "note": "The change applies to that role on the next request.",
+    }
+
+
+@ROUTER.post("/api/auth/password")
+def _auth_password(request: Request) -> Tuple[int, Any]:
+    """
+    Change your own password. Requires the current one, so a borrowed session
+    cannot be used to lock the real owner out.
+    """
+    user = config.current_request_user()
+    if user is None:
+        raise ApiError("Sign in to do that.", status=401, unauthenticated=True)
+
+    current = str(request.need("current_password"))
+    new = str(request.need("new_password"))
+
+    try:
+        auth.login(user["email"], current)      # verifies, and prunes sessions
+        auth.set_password(int(user["id"]), new)
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+
+    return 200, {"ok": True, "note": "Password updated."}
+
+
+# --------------------------------------------------------------------------
+# user management - Manager only
+# --------------------------------------------------------------------------
+
+@ROUTER.get("/api/users")
+def _users_list(request: Request) -> Tuple[int, Any]:
+    """
+    Every registered user with their role and dataset grants.
+
+    Gated on can_manage_access, so an Admin or Analyst calling this directly
+    gets a 403 rather than a user list.
+    """
+    _require("can_manage_access", "view the user list")
+    return 200, {
+        "users": auth.list_users(),
+        "roles": config.role_catalogue(),
+        "stats": auth.stats(),
+    }
+
+
+@ROUTER.post("/api/users/create")
+def _users_create(request: Request) -> Tuple[int, Any]:
+    _require("can_modify_roles", "create users")
+    try:
+        user = auth.create_user(
+            str(request.need("email")),
+            str(request.need("password")),
+            str(request.need("role")),
+        )
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+    return 200, {"user": user}
+
+
+@ROUTER.post("/api/users/role")
+def _users_set_role(request: Request) -> Tuple[int, Any]:
+    """Change a user's role. Written to the database immediately."""
+    _require("can_modify_roles", "change user roles")
+
+    actor = config.current_request_user() or {}
+    user_id = int(request.need("user_id"))
+    role = str(request.need("role"))
+
+    # A Manager demoting themselves would immediately lose the ability to undo
+    # it. auth.set_role already refuses to remove the last Manager; this catches
+    # the self-demotion case with a clearer message.
+    if int(actor.get("id") or 0) == user_id and role != auth.ROLE_MANAGER:
+        raise ApiError(
+            "You cannot remove your own Manager role. Ask another Manager to "
+            "change it, so you are not locked out of user management.",
+            status=409,
+        )
+
+    try:
+        user = auth.set_role(user_id, role, acting_user_id=actor.get("id"))
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+
+    return 200, {
+        "user": user,
+        "note": "Saved. The new role applies to that user's next request.",
+    }
+
+
+@ROUTER.post("/api/users/active")
+def _users_set_active(request: Request) -> Tuple[int, Any]:
+    _require("can_modify_roles", "enable or disable users")
+    actor = config.current_request_user() or {}
+    user_id = int(request.need("user_id"))
+    is_active = bool(request.opt("is_active", True))
+
+    if int(actor.get("id") or 0) == user_id and not is_active:
+        raise ApiError("You cannot disable your own account.", status=409)
+
+    try:
+        user = auth.set_active(user_id, is_active)
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+    return 200, {"user": user}
+
+
+@ROUTER.post("/api/users/datasets")
+def _users_set_datasets(request: Request) -> Tuple[int, Any]:
+    """
+    Restrict one user to a subset of the project's datasets.
+
+    An empty list removes the per-user restriction, so the project-wide
+    allowlist applies. A grant can only ever narrow that list.
+    """
+    _require("can_manage_access", "manage user dataset access")
+    user_id = int(request.need("user_id"))
+    datasets = request.opt("datasets", [])
+    if not isinstance(datasets, list):
+        raise ApiError("'datasets' must be a list of dataset names.")
+
+    try:
+        saved = auth.set_user_datasets(user_id, list(datasets))
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+
+    return 200, {
+        "user_id": user_id,
+        "datasets": saved,
+        "note": ("Saved. An empty list means the project-wide allowlist applies."
+                 if not saved else "Saved."),
+    }
+
+
+@ROUTER.post("/api/users/password")
+def _users_set_password(request: Request) -> Tuple[int, Any]:
+    """Reset another user's password. Manager only."""
+    _require("can_modify_roles", "reset user passwords")
+    user_id = int(request.need("user_id"))
+    try:
+        auth.set_password(user_id, str(request.need("password")))
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+    return 200, {"ok": True}
+
+
+@ROUTER.post("/api/users/delete")
+def _users_delete(request: Request) -> Tuple[int, Any]:
+    _require("can_modify_roles", "delete users")
+    actor = config.current_request_user() or {}
+    user_id = int(request.need("user_id"))
+    if int(actor.get("id") or 0) == user_id:
+        raise ApiError("You cannot delete your own account.", status=409)
+    try:
+        auth.delete_user(user_id)
+    except auth.AuthError as exc:
+        raise ApiError(exc.message, status=exc.status, **exc.extra) from exc
+    return 200, {"ok": True}
 
 
 def _safe_project_path(raw: str) -> pathlib.Path:
@@ -1645,6 +2345,8 @@ def _safe_project_path(raw: str) -> pathlib.Path:
 
 @ROUTER.post("/api/files/write")
 def _file_write(request: Request) -> Tuple[int, Any]:
+    _require("can_write_files", "write files into the project")
+
     path = _safe_project_path(str(request.need("path")))
     content = str(request.need("content"))
     mode = str(request.opt("mode", "overwrite"))
@@ -1694,25 +2396,53 @@ def _file_read(request: Request) -> Tuple[int, Any]:
 # --------------------------------------------------------------------------
 
 def handle(method: str, path: str, query: Dict[str, List[str]],
-           body: Dict[str, Any]) -> Tuple[int, Any]:
-    request = Request(method, path, query, body)
+           body: Dict[str, Any],
+           headers: Optional[Dict[str, str]] = None,
+           ) -> Tuple[int, Any, Dict[str, str]]:
+    """
+    Dispatch one API call.
+
+    Returns (status, payload, response_headers). The auth gate runs here rather
+    than in each handler so a new route cannot accidentally be left unprotected:
+    anything not explicitly listed in PUBLIC_ROUTES requires a valid session.
+    """
+    request = Request(method, path, query, body, headers)
+
     try:
-        return ROUTER.dispatch(request)
+        # ---- authenticate ------------------------------------------------
+        user = auth.resolve_session(request.session_token)
+        request.user = user
+        config.set_request_user(user)
+
+        if path not in PUBLIC_ROUTES and user is None:
+            return 401, {
+                "error": "Sign in to use dbt Studio.",
+                "unauthenticated": True,
+            }, {}
+
+        status, payload = ROUTER.dispatch(request)
+        return status, payload, request.response_headers
+
     except ApiError as exc:
-        return exc.status, exc.payload()
+        return exc.status, exc.payload(), request.response_headers
+    except auth.AuthError as exc:
+        return exc.status, {"error": exc.message, **exc.extra}, {}
     except warehouse.ScopeError as exc:
         # A policy refusal, not a bad request. Must precede WarehouseError.
-        return 403, exc.to_dict()
+        return 403, exc.to_dict(), {}
     except warehouse.WarehouseError as exc:
-        return 400, exc.to_dict()
+        return 400, exc.to_dict(), {}
     except jinja_sql.CompileError as exc:
-        return 400, exc.to_dict()
+        return 400, exc.to_dict(), {}
     except manifest_mod.ManifestNotFound as exc:
-        return 409, {"error": str(exc), "needs_parse": True}
+        return 409, {"error": str(exc), "needs_parse": True}, {}
     except Exception as exc:  # pragma: no cover
         import traceback
         return 500, {
             "error": f"Unhandled server error: {exc}",
             "type": type(exc).__name__,
             "traceback": traceback.format_exc(limit=8),
-        }
+        }, {}
+    finally:
+        # Never let one request's identity leak into the next on this thread.
+        config.clear_request_user()

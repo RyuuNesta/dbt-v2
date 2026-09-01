@@ -624,7 +624,18 @@ html[data-help="on"] .nav-item .nav-help {
 .callout.err  { background: var(--err-soft);  border-color: var(--err-line); }
 .callout.ok   { background: var(--ok-soft);   border-color: var(--ok-line); }
 .callout-ico { flex: 0 0 auto; font-size: 14px; line-height: 1.4; }
+/* The body sits next to a fixed-width icon in a flex row. Without min-width:0
+   a long, unbreakable string (a BigQuery error URL, say) forces the flex item
+   wider than its container and is clipped with no way to read the rest. */
+.callout > div { min-width: 0; flex: 1 1 auto; }
 .callout strong { display: block; margin-bottom: 2px; }
+/* The message itself: let long text wrap, and cap very long errors with an
+   internal scrollbar rather than pushing the panel wide or truncating. */
+.callout > div > span { display: block; overflow-wrap: anywhere; word-break: break-word; }
+.callout .callout-body {
+  max-height: 40vh; overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; word-break: break-word;
+}
 .callout code {
   background: var(--inset); padding: 1px 5px; border-radius: 4px;
   word-break: break-all;
@@ -1569,4 +1580,301 @@ table.data tbody tr.is-failed td:first-child { border-left: 2px solid var(--err)
     overflow: visible;
   }
   body.erd-printing .erd-svg { width: 100%; height: auto; }
+}
+
+/* ===================== documentation proposal ===================== */
+
+/* The tab strip and the Save action share one flex row. A real row rather than
+   an overlay: the status message can be long ("previous kept as ….bak") and
+   absolute positioning printed it straight through the tab labels. */
+.output-head-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+}
+/* The tabs take the slack and scroll on their own if the labels do not fit.
+   min-width:0 is what lets the flex item actually shrink. */
+.output-head-row .tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-bottom: 0;
+}
+.output-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px 4px 0;
+}
+.output-actions .input-tiny {
+  height: 26px;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+/* The save status is the one variable-length item; cap it and ellipsise rather
+   than letting it push the buttons off the edge. Full text is on the title. */
+.save-hint {
+  display: block;
+  max-width: 20ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 860px) {
+  /* Not enough width for one row; stack the actions under the tabs. */
+  .output-head-row {
+    flex-wrap: wrap;
+    align-items: stretch;
+  }
+  .output-head-row .tabs { flex: 1 1 100%; }
+  .output-actions {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+  }
+  .save-hint { max-width: 100%; }
+}
+
+/* ===================== create-table dialog ===================== */
+
+.create-table { display: flex; flex-direction: column; }
+.ct-section { margin-bottom: 18px; }
+.ct-section-title {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.create-table .field { margin-bottom: 12px; }
+.create-table select.select { width: 100%; }
+
+/* Schema field editor: name / type / mode / remove, aligned in a grid. */
+.ct-field-head,
+.ct-field-row {
+  display: grid;
+  grid-template-columns: 1fr 150px 130px 32px;
+  gap: 8px;
+  align-items: center;
+}
+.ct-field-head {
+  margin-bottom: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-dim);
+}
+.ct-field-row { margin-bottom: 6px; }
+.ct-fields { margin-top: 2px; }
+.input-tiny {
+  height: 30px;
+  padding: 3px 8px;
+  font-size: 12.5px;
+}
+select.input-tiny { height: 30px; }
+
+.ct-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ct-radio input { margin: 0; }
+
+@media (max-width: 620px) {
+  .ct-field-head, .ct-field-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* ===================== reference panel groups ===================== */
+
+/* Section headings inside the workbench "Insert a reference" list, separating
+   the accessible datasets/tables group from the dbt models and sources. */
+.ref-group-head {
+  margin: 12px 0 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.ref-group-sub {
+  margin: 8px 0 2px;
+  font: 11px var(--mono);
+  color: var(--text-faint);
+}
+
+/* ===================== settings: roles ===================== */
+
+.role-card {
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raise);
+}
+.role-card.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.role-card h4 { font-size: 14px; font-weight: 600; }
+.role-card ul { margin: 8px 0 0; }
+
+/* ===================== login ===================== */
+
+.login-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  padding: 32px 20px;
+  background: var(--bg);
+}
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 26px 28px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.login-head { margin-bottom: 20px; }
+.login-head h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.login-head p { margin: 0; }
+.login-form .field label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.login-form .input { width: 100%; }
+.btn-block { width: 100%; justify-content: center; }
+
+.login-roles {
+  width: 100%;
+  max-width: 380px;
+}
+.login-role {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 0;
+  border-top: 1px solid var(--line-soft);
+  line-height: 1.5;
+}
+.login-role:first-of-type { border-top: 0; }
+
+/* ===================== identity (sidebar) ===================== */
+
+.identity-box {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+.identity {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.identity-who { min-width: 0; }
+.identity-email {
+  display: block;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+/* Small download icon that opens a format menu. A button + popover rather than
+   a native <select>, so the glyph is never clipped by the browser's own arrow. */
+.download-wrap { position: relative; display: inline-flex; }
+.btn-icon {
+  min-width: 28px;
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.btn-icon svg { display: block; }
+.download-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  min-width: 150px;
+  padding: 4px;
+  background: var(--bg-raise);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.download-item {
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  padding: 6px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.download-item:hover { background: var(--row-hover); }
+
+/* Autocomplete anchored under a plain text input (the source-declaration
+   table field). Reuses the .autocomplete / .ac-item styles from the editor. */
+.ac-input-wrap { position: relative; display: block; }
+.ac-input-wrap .input { width: 100%; }
+.ac-input-wrap .autocomplete {
+  top: calc(100% + 3px);
+  left: 0;
+  min-width: 260px;
+  width: 100%;
+  max-width: none;
+}
+
+/* Editable permission-matrix cells. A clickable yes/no rather than static text,
+   shown only to a role that may modify roles. */
+.perm-toggle {
+  min-width: 30px;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.perm-toggle:hover { border-color: var(--accent); }
+.perm-toggle:disabled { opacity: .5; cursor: default; }
+.perm-toggle.is-on {
+  color: var(--ok);
+  border-color: var(--ok-line);
+  background: var(--ok-soft);
+}
+.perm-toggle.is-off {
+  color: var(--text-faint);
 }

@@ -15,6 +15,7 @@ import {
   resultGrid, schemaTable, sqlEditor, tabs, typeBadge,
 } from '../components.js';
 import { openSaveAsModel } from '../savemodel.js';
+import { openCreateTable } from '../createtable.js';
 
 export const meta = {
   title: 'Workbench',
@@ -95,6 +96,97 @@ export function render(navigate, params = {}) {
     '⤓ Save as model',
   );
 
+  /* The write dataset for the current target, e.g. data-analytics-asg.dbt_dev.
+     Used to scaffold a fully-qualified table name the way BigQuery's console
+     does when you click "Save results > BigQuery table". */
+  function targetRelationPrefix() {
+    const target = (state.boot?.targets || []).find((t) => t.name === state.target)
+      || (state.boot?.targets || [])[0];
+    if (!target) return '';
+    return `${target.project}.${target.dataset}`;
+  }
+
+  /* "Create table" — wrap the current SELECT in a CREATE OR REPLACE TABLE ... AS
+     (a CTAS) and load it into the editor so the name can be edited before Run.
+     This is the table equivalent of typing a CREATE statement in the BigQuery
+     console; the read-only policy now permits CREATE TABLE and CREATE VIEW. */
+  const createTableBtn = el(
+    'button.btn',
+    {
+      title: 'Create a BigQuery table — empty or from the current query',
+      onclick: () => openCreateTable({
+        currentSql: editor.value,
+        onSubmit: (sql) => {
+          /* Put the assembled statement in the editor so it is visible and
+             editable, then run it through the normal execute path. */
+          editor.value = sql;
+          execute();
+        },
+      }),
+    },
+    '⊞ Create table',
+  );
+
+  const createViewBtn = el(
+    'button.btn',
+    {
+      title: 'Wrap this query in CREATE OR REPLACE VIEW … AS, ready to run',
+      onclick: () => scaffoldDdl('view'),
+    },
+    '◫ Create view',
+  );
+
+  function scaffoldDdl(kind) {
+    const sql = editor.value.trim();
+    if (!sql) {
+      toast('Write a SELECT first.', { kind: 'warn' });
+      return;
+    }
+    const ok = jinja_sql_isSelect(sql);
+    if (!ok) {
+      toast('Start from a SELECT statement to wrap it.', {
+        kind: 'warn',
+        detail: 'The current statement does not look like a query to build a '
+          + `${kind} from.`,
+      });
+      return;
+    }
+
+    const prefix = targetRelationPrefix();
+    const placeholder = kind === 'table' ? 'new_table' : 'new_view';
+    const relation = prefix ? `\`${prefix}.${placeholder}\`` : placeholder;
+    const verb = kind === 'table'
+      ? 'create or replace table'
+      : 'create or replace view';
+
+    editor.value = `${verb} ${relation} as\n${sql.replace(/;\s*$/, '')}\n`;
+
+    /* Put the caret on the placeholder name so it can be renamed immediately. */
+    const idx = editor.node.querySelector('textarea')?.value.indexOf(placeholder);
+    const textarea = editor.node.querySelector('textarea');
+    if (textarea && idx >= 0) {
+      textarea.focus();
+      textarea.setSelectionRange(idx, idx + placeholder.length);
+    }
+
+    toast(`Rename ${placeholder}, then press Run to create the ${kind}.`, {
+      kind: 'info',
+    });
+  }
+
+  /* A light client-side check: is the statement a plain read we can wrap? Kept
+     simple on purpose - the backend policy is the real gate. */
+  function jinja_sql_isSelect(sql) {
+    const first = sql
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/--[^\n]*/g, ' ')
+      .trim()
+      .replace(/^\(+/, '')
+      .split(/\s+/)[0]
+      .toLowerCase();
+    return first === 'select' || first === 'with';
+  }
+
   let busy = false;
 
   function setBusy(next) {
@@ -103,6 +195,8 @@ export function render(navigate, params = {}) {
     validateBtn.disabled = next;
     compileBtn.disabled = next;
     saveBtn.disabled = next;
+    createTableBtn.disabled = next;
+    createViewBtn.disabled = next;
     runBtn.textContent = next ? 'Running…' : '▶ Run';
   }
 
@@ -152,6 +246,36 @@ export function render(navigate, params = {}) {
     renderStatus(payload, dryRun);
 
     const result = payload.result;
+
+    /* A CREATE VIEW / CREATE TABLE returns no result set. Show that it worked
+       and offer the SQL that ran, rather than an empty "no columns" grid. */
+    if (payload.ddl && !dryRun) {
+      const kind = payload.ddl_kind === 'table' ? 'table' : 'view';
+      const label = kind === 'table' ? 'Table created' : 'View created';
+      const body = kind === 'table'
+        ? 'BigQuery ran the statement and the table now exists in the target '
+          + 'dataset, populated with the query results. It is not part of the '
+          + 'dbt DAG, so add a model if you want dbt to manage and rebuild it.'
+        : 'BigQuery ran the statement and the view now exists in the target '
+          + 'dataset. It is not part of the dbt DAG, so add a model if you want '
+          + 'dbt to manage it.';
+      clear(statusBar).append(
+        el('span.chip.ok', `${kind} created`),
+        el('span.chip', ms(result.duration_ms)),
+        el('span.chip.info', `target ${result.target}`),
+      );
+      clear(resultHost).append(
+        el(
+          'div.panel-body',
+          callout(label, body, 'ok'),
+          el('div.mt',
+            el('p.small.faint', { style: { marginTop: 0 } }, 'The statement that ran:'),
+            codeBlock(result.executed_sql || payload.compiled.compiled_sql, { tall: false })),
+        ),
+      );
+      return;
+    }
+
     const contract = columnContract(result.columns);
 
     const view = tabs([
@@ -299,6 +423,8 @@ export function render(navigate, params = {}) {
               el('span.small.faint', 'row cap'),
               limitInput,
               compileBtn,
+              createViewBtn,
+              createTableBtn,
               saveBtn,
               validateBtn,
               runBtn,
@@ -335,11 +461,18 @@ function defaultStarter() {
 function refPanel(editor) {
   const search = el('input.input', {
     type: 'search',
-    placeholder: 'Find a model…',
+    placeholder: 'Find a model, table or dataset…',
     oninput: (event) => {
       const needle = event.target.value.trim().toLowerCase();
-      for (const row of list.children) {
-        row.hidden = Boolean(needle) && !row.dataset.name.includes(needle);
+      /* Query every button so the nested warehouse-group tables are filtered
+         too, not just the top-level model/source rows. */
+      for (const row of list.querySelectorAll('.list-btn')) {
+        row.hidden = Boolean(needle) && !(row.dataset.name || '').includes(needle);
+      }
+      /* Group headings hide when a filter is active, since they are not
+         themselves matches and would otherwise float over empty groups. */
+      for (const head of list.querySelectorAll('.ref-group-head, .ref-group-sub')) {
+        head.hidden = Boolean(needle);
       }
     },
   });
@@ -401,12 +534,72 @@ function refPanel(editor) {
     );
   }
 
+  /* Accessible datasets and their tables, beyond the dbt models. These are the
+     physical relations the current credentials can read within scope. Loaded
+     asynchronously from the warehouse inventory so the panel paints instantly;
+     the group is appended once the metadata arrives. Clicking inserts the fully
+     qualified `project.dataset.table`, since these have no ref(). */
+  const warehouseGroup = el('div');
+  list.append(warehouseGroup);
+
+  (async () => {
+    let payload;
+    try {
+      payload = await api.inventory();
+    } catch {
+      return; // inventory is a bonus here; models/sources already listed.
+    }
+
+    const tables = payload.tables || [];
+    if (!tables.length) return;
+
+    /* Skip the ones already offered as a dbt model, to avoid a duplicate row
+       that inserts a raw relation instead of ref(). */
+    const modelTables = new Set(
+      (state.models || [])
+        .map((m) => String(m.relation_name || '').replace(/`/g, '').toLowerCase())
+        .filter(Boolean),
+    );
+
+    warehouseGroup.append(
+      el('div.ref-group-head', `Datasets & tables · ${payload.project || ''}`),
+    );
+
+    const byDataset = new Map();
+    for (const table of tables) {
+      if (!byDataset.has(table.dataset)) byDataset.set(table.dataset, []);
+      byDataset.get(table.dataset).push(table);
+    }
+
+    for (const [dataset, rows] of [...byDataset.entries()].sort()) {
+      warehouseGroup.append(el('div.ref-group-sub', dataset));
+      for (const table of rows.sort((a, b) => a.table.localeCompare(b.table))) {
+        const relation = String(table.relation || '').replace(/`/g, '');
+        const bareRelation = table.relation
+          || `${payload.project}.${table.dataset}.${table.table}`;
+        if (modelTables.has(relation.toLowerCase())) continue;
+
+        warehouseGroup.append(
+          el('button.list-btn', {
+            dataset: { name: `${dataset}.${table.table}`.toLowerCase() },
+            title: `Insert ${bareRelation}`,
+            onclick: () => editor.insert(bareRelation),
+          },
+          el('span.chip.tiny', table.is_view ? 'view' : 'table'),
+          el('span.lb-name', table.table),
+          el('span.lb-meta', el('span.tiny.faint', dataset)),
+          ),
+        );
+      }
+    }
+  })();
+
   return el(
     'div.panel',
     el(
       'div.panel-head',
       el('h3', 'Insert a reference'),
-      el('span.muted.small', `${(state.models || []).length}`),
+      el('span.muted.small', 'models, sources & tables'),
     ),
     el(
       'div.panel-body',
@@ -416,8 +609,8 @@ function refPanel(editor) {
         'div.tiny.faint',
         { style: { marginBottom: 0, lineHeight: '1.6' } },
         el('div', el('kbd', 'Ctrl'), ' + ', el('kbd', 'Space'), ' — suggest columns, tables, functions and keywords'),
-        el('div', 'Type ', el('kbd', '.'), ' after a table alias for just that table\'s columns'),
-        el('div', 'Two or more characters also opens suggestions as you type'),
+        el('div', 'Type ', el('kbd', '.'), ' after a table alias for its columns, or after a dataset for its tables'),
+        el('div', 'Models insert ref(); accessible tables insert the full relation'),
       ),
     ),
   );

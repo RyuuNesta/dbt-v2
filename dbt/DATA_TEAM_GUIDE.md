@@ -5,6 +5,15 @@ use dbt Studio.
 
 Written for data engineers and data analysts. No prior dbt experience assumed.
 
+> **Current version.** This guide reflects the latest dbt Studio, which now has
+> **sign-in and role-based access control**, a **Settings** screen for managing
+> users, roles and dataset access, a **unified Documentation page** (three
+> sources × three description engines, plus dbt source declaration), and the
+> ability to **create views and tables from the Workbench**. Sections 11–15 and
+> the [cost analysis](#16-what-it-costs) are new. If you used an earlier build,
+> the biggest change is that you now log in, and what you can do depends on your
+> role.
+
 ---
 
 ## Contents
@@ -14,11 +23,17 @@ Written for data engineers and data analysts. No prior dbt experience assumed.
 3. [How this project is built](#3-how-this-project-is-built)
 4. [Getting started](#4-getting-started)
 5. [The UI, page by page](#5-the-ui-page-by-page)
-6. [The two documentation engines](#6-the-two-documentation-engines)
+6. [The documentation engines](#6-the-documentation-engines)
 7. [What is inside the generated documentation](#7-what-is-inside-the-generated-documentation)
 8. [Guardrails](#8-guardrails)
 9. [Troubleshooting](#9-troubleshooting)
 10. [Reference](#10-reference)
+11. [Signing in and roles (RBAC)](#11-signing-in-and-roles-rbac)
+12. [The Settings page](#12-the-settings-page)
+13. [The unified Documentation page](#13-the-unified-documentation-page)
+14. [Creating views and tables from the Workbench](#14-creating-views-and-tables-from-the-workbench)
+15. [Documenting tables dbt did not build](#15-documenting-tables-dbt-did-not-build)
+16. [What it costs](#16-what-it-costs)
 
 ---
 
@@ -243,6 +258,10 @@ python dbt_ui\serve.py
 
 Opens `http://localhost:8777`. Or double-click `dbt_ui\start_dbt_ui.bat`.
 
+**You now sign in.** On first start, three default accounts exist — sign in as
+`manager@gmail.com` / `manager123` for full access, and change the password
+afterward. See [section 11](#11-signing-in-and-roles-rbac).
+
 **Important:** only run one server at a time. If the port is taken, it silently
 moves to the next free one and your browser keeps talking to the old process, so
 your changes appear not to work. Check with:
@@ -270,7 +289,14 @@ A healthy `dbt build` ends with `PASS=46 WARN=0 ERROR=0 SKIP=0`.
 
 ## 5. The UI, page by page
 
-Press `1`–`7` to switch pages. The header is always visible.
+Click a page in the sidebar to switch. The header is always visible.
+
+> **Two things changed recently.** (1) You sign in first — see
+> [section 11](#11-signing-in-and-roles-rbac). (2) There is now a **Settings**
+> page in the sidebar ([section 12](#12-the-settings-page)), and the header no
+> longer has a target dropdown or number-key shortcuts. The page descriptions
+> below still hold; the Documentation page in particular was rebuilt into one
+> unified screen, covered in [section 13](#13-the-unified-documentation-page).
 
 ### The header
 
@@ -505,7 +531,13 @@ Useful for *"what exists in BigQuery that is not in dbt yet?"*
 
 ---
 
-## 6. The two documentation engines
+## 6. The documentation engines
+
+> The Documentation page is now one unified screen — see
+> [section 13](#13-the-unified-documentation-page) for how Source and
+> Descriptions are chosen. This section is the deep comparison of the two
+> description engines (AI vs Pattern); a third choice, **None**, simply leaves
+> descriptions blank for you to fill in.
 
 Both produce **the same artifact** — a dbt schema YAML block with name,
 `data_type`, description, and justified tests. Only the prose differs, which is
@@ -912,11 +944,18 @@ blocked inside `target/`, `dbt_packages/`, `logs/` and `.git/`. Overwrites leave
 An allow-list — the browser sends a verb, never a command line. Selector strings
 are validated before being passed as argv, so `a; drop table b` is refused.
 
-### No authentication
+### Authentication and roles
 
-The server binds to `127.0.0.1` and is meant for one person's machine. It can
-query BigQuery with your credentials. **Do not bind it to `0.0.0.0`** without an
-authenticating proxy in front.
+The UI now **requires sign-in**, and what each user can do is governed by a role
+(Admin / Manager / Analyst). This is enforced in the backend, not just the UI.
+See [section 11](#11-signing-in-and-roles-rbac) for the model and
+[section 12](#12-the-settings-page) for managing it.
+
+The server still binds to `127.0.0.1` and the session cookie travels over plain
+HTTP, so **do not bind it to `0.0.0.0`** without TLS in front. The role system
+guards against accidents among trusted teammates; it is not a substitute for
+BigQuery IAM, which is what actually limits what the underlying credentials can
+reach.
 
 ---
 
@@ -1057,3 +1096,341 @@ dbt-bigquery 1.12.0, Python 3.14.
 | **relation** | A fully qualified `project.dataset.table` |
 | **grain** | What one row of a table represents |
 | **dry run** | BigQuery plans a query without executing it. Free, and returns the output schema |
+
+---
+
+## 11. Signing in and roles (RBAC)
+
+dbt Studio now requires you to sign in, and what you can do depends on your role.
+This is real access control: every permission is checked again on the server
+before an action runs, so hiding a button is a convenience, not the boundary —
+calling the API directly still returns `403`.
+
+### Signing in
+
+Open the URL and you get a login screen. Enter your email and password. The
+session is kept in an `HttpOnly` cookie (12-hour life, 4-hour idle timeout), so
+page JavaScript can never read the token. Sign out from the identity box at the
+bottom of the sidebar.
+
+### The three roles
+
+The names are a little counter-intuitive, so read this carefully: **Manager is
+the most powerful role, not Admin.**
+
+| Role | In one line |
+| --- | --- |
+| **Manager** | The privileged role. Modifies tables, runs dbt, manages users, roles and dataset access, configures the connection. |
+| **Admin** | Full **visibility**, no changes. Sees every screen including configuration, but cannot write, run dbt, or manage users. |
+| **Analyst** | Read-only. Views datasets, schemas, documentation, and queries data. No writes of any kind. |
+
+### The permission matrix
+
+| Permission | Admin | Manager | Analyst |
+| --- | :---: | :---: | :---: |
+| Login | ✅ | ✅ | ✅ |
+| View Data Studio | ✅ | ✅ | ✅ |
+| View tables | ✅ | ✅ | ✅ |
+| Read data | ✅ | ✅ | ✅ |
+| View database configuration | ✅ | ✅ | ❌ |
+| Modify tables (write files) | ❌ | ✅ | ❌ |
+| Manage user access | ❌ | ✅ | ❌ |
+| Modify user roles | ❌ | ✅ | ❌ |
+| Configure database | ❌ | ✅ | ❌ |
+| Modify datasets | ❌ | ✅ | ❌ |
+| Write/delete data (run dbt) | ❌ | ✅ | ❌ |
+
+This matrix is **editable** by a Manager — see [section 12](#the-permission-matrix-editable).
+Login is pinned on for every role and cannot be turned off.
+
+### Default accounts
+
+Created automatically on first start, for development and testing only:
+
+| Email | Password | Role |
+| --- | --- | --- |
+| `manager@gmail.com` | `manager123` | Manager |
+| `admin@gmail.com` | `admin123` | Admin |
+| `analyst@gmail.com` | `analyst123` | Analyst |
+
+**Change these passwords once you are in** (Settings → Your account, or a Manager
+can reset them). They are documented here, so treat them as public.
+
+### How it is stored
+
+Users, password hashes, sessions and per-user dataset grants live in a small
+SQLite database at `dbt_ui/.runtime/studio.db` (gitignored). Passwords are hashed
+with PBKDF2-HMAC-SHA256 (per-user salt, high iteration count) — the plaintext is
+never stored. Only the SHA-256 of a session token is kept, so a database dump
+yields no usable sessions. A role change takes effect on that user's **next
+request**, even if they are already signed in.
+
+---
+
+## 12. The Settings page
+
+A new page in the sidebar (⚙). What you see depends on your role — most of it is
+Manager-only.
+
+### BigQuery dataset access
+
+Every dataset your credentials can see, each with a checkbox for whether this UI
+may use it. Tick to allow, untick to revoke. The saved list replaces the
+built-in default, and it drives the whole app — the workbench, autocomplete,
+documentation, everything.
+
+- **Managers** can edit it. Everyone else sees it read-only.
+- Ticking a box never grants access you do not already have in BigQuery IAM — it
+  only decides what this app is *willing* to touch.
+- Saved to `dbt_ui/.runtime/access.json`. An empty selection falls back to the
+  built-in default (bronze + silver across every target).
+- Per-user grants are also possible from the Users panel: a user can be
+  restricted to a subset of the allowed datasets. A grant can only ever narrow
+  the project list, never widen it.
+
+### Users & roles (Manager only)
+
+A table of every registered user with their email, role, dataset access and
+status. A Manager can:
+
+- **Change a role** — a dropdown per user; saves immediately and applies on that
+  user's next request.
+- **Add a user** — email, password, role.
+- **Enable / disable** an account (disabling revokes their live sessions).
+- **Reset a password**, or restrict a user to specific datasets.
+
+Safety rails: you cannot demote or disable **your own** account, and the **last
+remaining Manager** cannot be demoted, disabled or deleted — otherwise nobody
+could ever manage roles again.
+
+### The permission matrix (editable)
+
+The matrix from [section 11](#the-permission-matrix) is shown here, and to a
+**Manager every cell is a clickable toggle**. Click a cell to flip that
+permission on or off for that role. It saves immediately, persists across
+restarts, and applies to everyone with that role on their next request. It is the
+real control — enabling "Modify tables" for Admin genuinely lets an admin write
+files, and turning it off restores the `403`.
+
+Guardrails: **Login** is pinned on and shows a lock. You cannot remove "Modify
+user roles" from the last role that has it. Non-managers see the matrix
+read-only.
+
+### Your account
+
+Change your own password (requires the current one).
+
+---
+
+## 13. The unified Documentation page
+
+The Documentation page was rebuilt. Previously there were separate "engine"
+cards that were really the same machine relabelled. Now it is **one screen with
+two independent choices**:
+
+### Source — where the columns come from
+
+| Source | What it does | Output |
+| --- | --- | --- |
+| **A dbt model** | Reads the live table definition of a model you pick | `models:` schema YAML |
+| **A query** | Dry-runs a `SELECT` and uses its output columns | `models:` schema YAML |
+| **An existing table** | A `dataset.table` dbt does **not** build (with autocomplete) | `sources:` block |
+
+### Descriptions — who writes the prose
+
+| Engine | Notes |
+| --- | --- |
+| **Pattern** | Deterministic local rules. Free, offline, reproducible. |
+| **AI (Gemini)** | Richer prose, understands SAP field names. Needs a free key. |
+| **None** | Schema only — columns come back blank for you to fill in by hand. |
+
+The two are orthogonal: any source pairs with any engine. **dbt itself never
+writes descriptions** — it has no engine for that — so the prose always comes
+from Pattern or AI. See [section 6](#6-the-documentation-engines) for the
+AI-vs-Pattern comparison, which still applies.
+
+### The proposal
+
+After generating, you get an editable proposal:
+
+- **Click any description to edit it in place.** The YAML rebuilds as you type.
+- Tabs for the Contract, the bare `name + data_type`, the full YAML, and
+  Markdown.
+- A **download icon** (↓) next to Save opens a menu: YAML, CSV, Markdown, JSON.
+  CSV is the one to hand to a spreadsheet.
+- **Save** writes it into the project (backing up any existing file to `.bak`).
+  Then Refresh manifest so dbt picks it up.
+
+> Saving and running are gated by role. An Analyst can generate and download a
+> draft (a read) but cannot Save (a write) — that is a Manager action.
+
+---
+
+## 14. Creating views and tables from the Workbench
+
+The Workbench is still read-only for exploration, with **two sanctioned
+exceptions**: you can now create a **view** or a **table**, the way you would in
+the BigQuery console.
+
+### CREATE VIEW / CREATE TABLE by hand
+
+Type a `CREATE VIEW …`, `CREATE OR REPLACE VIEW …`, or `CREATE [OR REPLACE]
+TABLE …` statement and run it (`Ctrl+Enter`). It executes and you get a "View
+created" / "Table created" confirmation instead of an empty grid.
+
+Still blocked, deliberately: `CREATE FUNCTION`, `CREATE PROCEDURE`, `DROP`,
+`DELETE`, `INSERT`, `MERGE`, `TRUNCATE`, `ALTER`. Those change or destroy data and
+belong in a reviewed model.
+
+### The Create-table dialog
+
+The **⊞ Create table** button opens a BigQuery-console-style dialog:
+
+- **Source** — an empty table, or the query currently in the editor (CTAS).
+- **Destination** — project, dataset, table (project and dataset prefilled from
+  the target).
+- **Schema** — field rows (name / type / mode) with an "edit as text" toggle, for
+  an empty table.
+- **Partitioning** — none, or partition by a column.
+- A live SQL preview, then Create.
+
+There is also a **◫ Create view** button that wraps the current SELECT in a
+`CREATE OR REPLACE VIEW … AS`.
+
+### Table autocomplete everywhere it helps
+
+Both the Workbench editor and the source-declaration input suggest **datasets**
+first, then **tables** inside a dataset after you type the dot. So you never have
+to remember table names — type `bronze_dbt.` and pick from the list.
+
+> Creating a view/table is a **write**, so it is a Manager action (`403` for
+> Analyst/Admin). It writes to BigQuery within the allowed dataset scope only,
+> and objects created this way are **not** part of the dbt DAG — for anything you
+> want dbt to manage, use a model or declare a source ([section 15](#15-documenting-tables-dbt-did-not-build)).
+
+---
+
+## 15. Documenting tables dbt did not build
+
+dbt only documents what is in the project. To make dbt aware of a **pre-existing
+/ foreign table** (one it did not build — e.g. a Debezium landing table), you
+declare it as a **dbt source**. The Documentation page does this when you set
+**Source = An existing table**:
+
+1. Type the table (`dataset.table`, with autocomplete).
+2. It reads the real schema from BigQuery (a free metadata call) and drafts a
+   `sources:` block, with Pattern or AI descriptions.
+3. Edit the descriptions in place, then **Save** to `models/_sources.yml`.
+4. **Register with dbt** — a one-click step that runs `dbt parse` then
+   `dbt docs generate`, so dbt now recognises the table, includes it in the docs
+   site and lineage, and lets you reference it with `source('…', '…')`.
+
+The Silver Advisor was also extended: it can now profile and recommend silver
+work for **any** in-scope table, not just dbt-built ones. A foreign table can
+even generate a silver model — it just reads the table by its full name instead
+of `ref()`, with a note in the SQL on how to promote it to a source.
+
+> Reading the schema and drafting descriptions is free (metadata + local rules or
+> the Gemini free tier). "Register with dbt" runs dbt commands (Manager only) and
+> `dbt docs generate` touches the warehouse catalog, so it needs BigQuery access.
+
+---
+
+## 16. What it costs
+
+The honest headline: **dbt Studio, dbt Core, and this UI are all free.** Every
+real cost is BigQuery (and, if you host the UI, a little compute). These figures
+come from Google's published on-demand pricing and reasonable assumptions about a
+100-table medallion project — **not** a measured bill.
+
+### The pricing that matters
+
+| Meter | Rate |
+| --- | --- |
+| BigQuery compute (on-demand) | $6.25 / TiB scanned. **First 1 TiB/month free.** |
+| BigQuery storage (active) | ~$0.023 / GiB / month. **First 10 GiB free.** |
+| dbt Core | $0 (open source) |
+| dbt Studio (this UI) | $0 (Python stdlib, runs locally) |
+
+**The 10 MB minimum.** BigQuery bills a **minimum of 10 MB per query, and 10 MB
+per table a query references**. Cleansing 1 KB costs the same as 10 MB. For many
+small tables the *number of queries* drives cost more than data volume. Free
+things worth remembering: failed and cached queries, `CREATE VIEW` (no scan),
+and batch loads/copies/exports/deletes all cost **$0**.
+
+### Daily transformation of 100 tables (Debezium not counted)
+
+Assuming the pipeline runs once a day and the source data is already in BigQuery:
+
+| Approach | Compute/month | Notes |
+| --- | --- | --- |
+| **Incremental** (recommended) | **$0** | Only the daily delta is scanned; ~29–293 GiB/month stays under the 1 TiB free tier |
+| Full-refresh, small tables | **$0** | ~59 GiB/month, still free |
+| Full-refresh, ~1 GiB tables each | ~$30 | Full scan × 30 days; avoid — use incremental |
+
+Storage: silver is a view ($0); bronze + gold as tables ≈ **$1–2/month** for tens
+of GiB. So the daily transform is realistically **~$0–3/month**.
+
+### Deploying to GCP for a team of 8 (2–3 hrs/day, daily)
+
+If you host the UI on GCP instead of a laptop, and **BigQuery query cost is
+counted separately** (as you asked), the only new cost is running the app:
+
+| Component | $/month |
+| --- | --- |
+| Cloud Run service (UI, ~3 hrs/day active, scale-to-zero) | ~$3–6 |
+| Cloud Scheduler (daily dbt trigger) | $0 (free tier) |
+| Artifact Registry (container image) | ~$0.10 |
+| Secret Manager / networking (same region) | ~$0 |
+| **Total hosting** | **≈ $3–6 / month** |
+
+So **deploying dbt Studio for 8 people costs roughly $3–6/month** in GCP compute,
+on top of whatever BigQuery bills for the queries themselves.
+
+### If you include the interactive query cost
+
+Eight analysts running light exploration (documentation, previews — this UI caps
+every query at 20 GiB and previews are LIMIT-wrapped) typically stay **inside the
+1 TiB/month free tier**, so query cost is often **$0**. Heavy multi-GB scans
+across the team could push it to tens of dollars, but that is a workload choice,
+not a floor.
+
+### Real-time (CDC) instead of daily
+
+Cost scales almost linearly with how often you transform to keep data fresh:
+
+| Freshness | Transform compute/month* |
+| --- | --- |
+| Daily (batch) | $0 |
+| Hourly | ~$2–3 |
+| Every 15 min | ~$30 |
+| Every 5 min | ~$100 → **switch to slot/Editions pricing here** |
+
+\* incremental, delta hitting the 10 MB floor per table. At high frequency the
+per-query floor dominates; that is the point where BigQuery **capacity (slot)
+pricing** — which has no 10 MB floor — becomes cheaper than on-demand.
+
+### Bottom line
+
+- **Software: $0.** dbt, dbt Core, this UI.
+- **Daily 100-table transform: ~$0–3/month** (use incremental to stay at $0).
+- **Hosting for 8 people on GCP: ~$3–6/month.**
+- **Total realistic monthly cost: roughly $5–15**, dominated by hosting, not by
+  BigQuery, as long as tables are not enormous and you do not full-refresh them
+  daily.
+
+### How to keep it cheap
+
+1. **Incremental models** for large tables — the single biggest lever; keeps
+   compute at $0.
+2. **Partition + cluster** by date so queries scan less.
+3. **Run only as often as the data needs** — daily beats hourly 24×.
+4. **Watch tests** — each `dbt test` is its own query with its own 10 MB floor;
+   100 models × 4 tests = 400 queries. Keep tests meaningful.
+5. The 20 GiB per-query cap is already on, so a runaway scan fails rather than
+   bills.
+
+> Every number here is from Google's price list and assumed workload sizes, not
+> your actual usage. The two things that move it most are **table size** and
+> **incremental vs full-refresh**. Nothing has been measured against the project
+> yet because the BigQuery `jobs.create` permission is still unresolved.

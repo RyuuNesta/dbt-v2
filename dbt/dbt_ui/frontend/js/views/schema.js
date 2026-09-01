@@ -1,614 +1,420 @@
 /* ==========================================================================
    schema.js - the Documentation page.
 
-   Three modes, chosen on entry:
+   One screen, two independent choices, rather than the old three "engine"
+   cards that were really the same machine relabelled:
 
-     AI          Gemini writes the descriptions from the column names, types and
-                 measured profile. Better prose, understands SAP conventions,
-                 needs a free API key.
-     Pattern     Deterministic name-matching rules. No network, no key, no
-                 quota, identical output every run.
-     Edit        Opens the descriptions already committed to the project's YAML
-                 and lets you correct them in place.
+     Source       where the columns come from
+                    - Model          a dbt model, types read from its table
+                    - Query          a SELECT, dry-run for its output columns
+                    - Existing table a dataset.table dbt does not build
 
-   AI and Pattern both produce the same artifact: a dbt schema YAML block with
-   name, data_type, description and the tests the data justifies. Only the prose
-   differs, which is what makes them directly comparable. They generate a *new*
-   block for you to review and write.
+     Descriptions who writes the prose
+                    - Pattern   deterministic local rules (free, offline)
+                    - AI        Gemini
+                    - None      schema only, TODO placeholders to fill by hand
 
-   Edit is the other half of the loop. Generated prose is a first draft, and the
-   person who knows what a column really means is usually reading it a week
-   later. Sending them back through a generator to fix one sentence would
-   rewrite the whole file, so Edit patches just the description values and
-   leaves comments, tests and key order untouched.
+   The two are orthogonal: any source pairs with any description engine. The
+   only thing the source decides is the *output shape*:
+
+     Model / Query    -> a models: schema YAML (a model contract)
+     Existing table   -> a sources: block (declares the table to dbt), and it
+                         is the only source that offers the register-with-dbt
+                         step (dbt parse + dbt docs generate) that makes dbt
+                         actually track and document the table.
+
+   dbt itself never writes descriptions - it has no engine for that - so the
+   prose always comes from Pattern or AI. The "dbt" value in the Existing-table
+   path is the sources: declaration plus the dbt commands that ingest it.
    ========================================================================== */
 
 import {
-  api, clear, copy, download, el, num, pct, plainRelation, state, toast,
+  api, can, clear, copy, download, el, num, pct, state, toast,
 } from '../core.js';
 import {
-  callout, codeBlock, columnContract, emptyState, layerChip, loading,
-  schemaTable, sqlEditor, tabs,
+  callout, codeBlock, columnContract, emptyState, loading,
+  layerChip, schemaTable, sqlEditor, tabs, typeBadge,
 } from '../components.js';
-import { documentationEditor } from '../docedit.js';
+import { watchJob } from '../jobs.js';
 
 export const meta = {
   title: 'Documentation',
-  subtitle: 'Generate column contracts and descriptions, by AI or by pattern rules',
+  subtitle: 'Document a model, a query, or an existing table - descriptions by pattern rules or AI',
 };
 
-/* Remembered across navigations so you land back where you were working. */
-let chosenEngine = null;
+/* Remembered across navigations so the page reopens where you left it. */
+const remembered = { source: 'model', engine: 'pattern' };
 
 export function render(navigate, params = {}) {
-  if (params.engine) chosenEngine = params.engine;
-
-  if (!chosenEngine) return chooser(navigate);
-  if (chosenEngine === 'edit') return editor(navigate, params);
-  return generator(navigate, params, chosenEngine);
+  return documentation(navigate, params);
 }
 
 /* ======================================================================
-   engine chooser
+   the one unified view
    ====================================================================== */
 
-function chooser(navigate) {
-  const ai = state.boot?.ai || {};
-  const host = el('div');
-
-  const cards = el(
-    'div.grid.grid-2',
-    engineCard({
-      badge: 'AI',
-      title: 'AI documentation',
-      tagline: 'Gemini reads your schema and writes the descriptions',
-      points: [
-        'Understands source-system conventions, including SAP field names like BUKRS and DMBTR',
-        'Uses the measured profile: null rates, cardinality, observed ranges, frequent values',
-        'Flags its own uncertainty with "Unclear:" instead of inventing a purpose',
-        'One request per table, so the free tier goes a long way',
-      ],
-      status: ai.configured
-        ? el('span.chip.ok', `ready · ${ai.key_masked}`)
-        : el('span.chip.warn', 'needs a free API key'),
-      note: ai.configured
-        ? `Key from ${ai.key_source}. Default model ${ai.default_model}.`
-        : 'Free key from Google AI Studio, no credit card, no GCP admin needed.',
-      cta: ai.configured ? 'Use AI documentation' : 'Set up AI documentation',
-      accent: 'var(--accent)',
-      onclick: () => {
-        chosenEngine = 'ai';
-        navigate('schema', { engine: 'ai' });
-      },
-    }),
-
-    engineCard({
-      badge: 'RULES',
-      title: 'Pattern documentation',
-      tagline: 'Deterministic rules built into dbt Studio',
-      points: [
-        'No network call, no API key, no quota, works offline',
-        'Same input always produces the same output, so diffs stay clean',
-        'Recognises the conventions in this project: audit columns, _is_/_has_ flags, period columns',
-        'Marks anything it cannot infer as TODO for a human to finish',
-      ],
-      status: el('span.chip.ok', 'always available'),
-      note: 'This is the engine that produced the descriptions currently in the project.',
-      cta: 'Use pattern documentation',
-      accent: 'var(--silver)',
-      onclick: () => {
-        chosenEngine = 'pattern';
-        navigate('schema', { engine: 'pattern' });
-      },
-    }),
-  );
-
-  /* Counted so the edit card can say something useful about how much
-     documentation is already committed rather than just "open the editor". */
-  const documented = (state.models || []).filter(
-    (model) => model.in_scope !== false && model.has_description,
-  ).length;
-  const inScopeTotal = (state.models || []).filter((m) => m.in_scope !== false).length;
-
-  host.append(
-    el(
-      'div.panel.mb',
-      el('div.panel-head', el('h3', 'Choose how descriptions get written')),
-      el(
-        'div.panel-body',
-        el(
-          'p.muted',
-          { style: { marginTop: 0, lineHeight: '1.65' } },
-          'Both engines read the real column types from BigQuery and emit the same schema YAML. ' +
-            'The difference is who writes the prose. You can switch at any time, and generating ' +
-            'with one does not overwrite what the other produced until you click write.',
-        ),
-      ),
-    ),
-    cards,
-    el(
-      'div.panel.mt',
-      { style: { borderTop: '2px solid var(--info)' } },
-      el(
-        'div.panel-body',
-        el(
-          'div.row.wrap.between',
-          { style: { gap: '14px' } },
-          el(
-            'div',
-            { style: { flex: '1 1 420px', minWidth: 0 } },
-            el(
-              'div.row.mb',
-              { style: { gap: '9px' } },
-              el('span.chip.info', 'EDIT'),
-              el('h3', { style: { fontSize: '15px' } }, 'Edit the documentation already committed'),
-            ),
-            el(
-              'p.small.muted',
-              { style: { margin: '0 0 8px', lineHeight: '1.65' } },
-              'Open the descriptions that are in the project right now and correct them in ' +
-                'place. Use this when a generated draft is nearly right, or when you know ' +
-                'what a column actually means and want to say so properly.',
-            ),
-            el(
-              'ul',
-              { style: { margin: '0 0 10px', paddingLeft: '18px', lineHeight: '1.7' } },
-              el('li.small.muted', 'Edits save themselves a few seconds after you stop typing'),
-              el(
-                'li.small.muted',
-                'Only description text is rewritten - your comments, tests, config and ' +
-                  'key order are left exactly as they are',
-              ),
-              el(
-                'li.small.muted',
-                'Refuses to save over a file that changed underneath you, so a git pull ' +
-                  'cannot silently eat your work',
-              ),
-              el('li.small.muted', 'Download the result as YAML, JSON or Markdown'),
-            ),
-            el(
-              'p.tiny.faint',
-              { style: { margin: 0, lineHeight: '1.5' } },
-              'This writes to the schema YAML files in your working copy. It does not touch ' +
-                'BigQuery and it does not commit anything to git.',
-            ),
-          ),
-          el(
-            'div',
-            { style: { flex: '0 0 auto', textAlign: 'right' } },
-            el(
-              'div.mb',
-              inScopeTotal
-                ? el(
-                    `span.chip.${documented === inScopeTotal ? 'ok' : 'warn'}`,
-                    `${documented} of ${inScopeTotal} models described`,
-                  )
-                : el('span.chip', 'no models in scope'),
-            ),
-            el(
-              'button.btn.btn-primary',
-              {
-                onclick: () => {
-                  chosenEngine = 'edit';
-                  navigate('schema', { engine: 'edit' });
-                },
-              },
-              'Open the editor',
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
-
-  return host;
-}
-
-function engineCard({ badge, title, tagline, points, status, note, cta, accent, onclick }) {
-  return el(
-    'div.panel',
-    { style: { borderTop: `2px solid ${accent}` } },
-    el(
-      'div.panel-body',
-      el(
-        'div.row.between.mb',
-        el(
-          'div.row',
-          { style: { gap: '9px' } },
-          el('span.chip.info', badge),
-          el('h3', { style: { fontSize: '15px' } }, title),
-        ),
-        status,
-      ),
-      el('p.small.muted', { style: { marginTop: 0 } }, tagline),
-      el(
-        'ul',
-        { style: { margin: '12px 0', paddingLeft: '18px', lineHeight: '1.7' } },
-        ...points.map((point) => el('li.small.muted', point)),
-      ),
-      el('p.tiny.faint', { style: { lineHeight: '1.5' } }, note),
-      el('button.btn.btn-primary.btn-block.mt', { onclick }, cta),
-    ),
-  );
-}
-
-/* ======================================================================
-   generator
-   ====================================================================== */
-
-function generator(navigate, params, engine) {
+function documentation(navigate, params = {}) {
   const host = el('div');
   const output = el('div.mt');
-  const isAi = engine === 'ai';
+  const canWrite = can('can_write_files');
+  const canRunDbt = can('can_run_dbt');
 
-  let mode = params.sql ? 'sql' : 'model';
-  let selected = params.model || state.scratch.schemaModel || firstModel();
+  const target = (state.boot?.targets || []).find((t) => t.name === state.target)
+    || (state.boot?.targets || [])[0] || {};
+  const exampleDataset = (state.boot?.scope?.allowed_datasets || ['bronze_dbt'])[0];
+
   let aiStatus = state.boot?.ai || {};
   let aiModel = aiStatus.default_model || 'gemini-2.5-flash';
 
-  const profileToggle = checkbox(
-    'Profile the data',
-    true,
-    isAi
-      ? 'Strongly recommended. The measurements are what let the model say something specific instead of paraphrasing the column name.'
-      : 'Measures nulls, cardinality and ranges so the descriptions and test suggestions are evidence-based.',
-  );
-  const testsToggle = checkbox('Suggest tests', true, 'Only proposes a test the profile justifies.');
-  const docsToggle = checkbox('Include descriptions', true, '');
+  /* Source + engine, restored from last visit or a deep link. */
+  let source = params.relation ? 'table' : params.sql ? 'query' : (remembered.source || 'model');
+  let engine = remembered.engine || 'pattern';
+  let selected = params.model || state.scratch.schemaModel || firstModel();
 
-  // Off by default. This is the only setting that sends real values from your
-  // tables to Google rather than just structural statistics.
-  const samplesToggle = checkbox(
-    'Send sample values to Gemini',
-    false,
-    'Off: only structure leaves your machine (column names, types, null rates, distinct counts). ' +
-      'On: also sends observed min/max and the most frequent values, which are real figures from your tables. ' +
-      'It improves the descriptions, but decide whether that is acceptable for this data.',
-  );
+  /* ---------------------------------------------------- source: model --- */
+
+  const modelList = el('div.scroll-list');
+  function paintModelList() {
+    clear(modelList);
+    const models = state.models || [];
+    const inScope = models.filter((m) => m.in_scope !== false);
+    const blocked = models.filter((m) => m.in_scope === false);
+    for (const model of [...inScope, ...blocked]) {
+      const outOfScope = model.in_scope === false;
+      modelList.append(el('button', {
+        class: `list-btn${model.name === selected ? ' sel' : ''}${outOfScope ? ' out-of-scope' : ''}`,
+        dataset: { name: model.name.toLowerCase() },
+        title: outOfScope ? `Outside the permitted scope (dataset ${model.dataset})` : model.name,
+        onclick: () => {
+          if (outOfScope) {
+            toast(`${model.name} is outside the permitted dataset scope.`, {
+              kind: 'warn',
+              detail: `It lives in '${model.dataset}'. Permitted: ${(state.scope?.allowed_datasets || []).join(', ')}.`,
+            });
+            return;
+          }
+          selected = model.name;
+          state.scratch.schemaModel = model.name;
+          paintModelList();
+          generate();
+        },
+      },
+        layerChip(model.layer),
+        el('span.lb-name', model.name),
+        el('span.lb-meta',
+          outOfScope ? el('span.chip.err', 'out of scope')
+            : model.has_description ? el('span.chip.ok', `${model.documented_columns}/${model.column_count}`)
+            : el('span.chip.warn', 'undoc'))));
+    }
+  }
+
+  /* ---------------------------------------------------- source: query --- */
 
   const sqlEditorInstance = sqlEditor({
     value: params.sql || `select *\nfrom {{ ref('${selected || 'your_model'}') }}\n`,
     placeholder: "select ... from {{ ref('model') }}",
   });
-
   const nameInput = el('input.input', { value: 'my_new_model', placeholder: 'model name' });
 
-  const generateBtn = el(
-    'button.btn.btn-primary.btn-block',
-    { onclick: () => generate() },
-    isAi ? '✦ Generate with Gemini' : '⚙ Generate contract',
-  );
+  /* --------------------------------------------- source: existing table --- */
 
-  /* ------------------------------------------------------- header bar --- */
+  const relInput = el('input.input', {
+    placeholder: `${exampleDataset}.your_table`,
+    'aria-label': 'Fully-qualified table to declare',
+    value: params.relation || '',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    style: { fontFamily: 'var(--mono)' },
+  });
+  const acMenu = el('div.autocomplete', { hidden: true });
+  const relWrap = el('div.ac-input-wrap', relInput, acMenu);
+  const tableCache = new Map();
+  let acRows = [];
+  let acSel = -1;
 
-  const engineBar = el(
-    'div.row.between.mb',
-    el(
-      'div.row',
-      { style: { gap: '9px' } },
-      el(`span.chip.${isAi ? 'info' : 'ok'}`, isAi ? 'AI · Gemini' : 'Pattern rules'),
-      el(
-        'span.small.faint',
-        isAi
-          ? 'Descriptions written by a language model from your schema and profile'
-          : 'Descriptions from deterministic name-matching rules',
-      ),
-    ),
-    el(
-      'button.btn.btn-tiny',
-      {
-        onclick: () => {
-          chosenEngine = null;
-          navigate('schema');
+  const allowedDatasets = () => (state.boot?.scope?.allowed_datasets || []).map(String);
+
+  async function tablesIn(dataset) {
+    const key = dataset.toLowerCase();
+    if (tableCache.has(key)) return tableCache.get(key);
+    try {
+      const payload = await api.autocompleteSchema(dataset);
+      const names = (payload.tables || []).map((t) => t.table);
+      tableCache.set(key, names);
+      return names;
+    } catch {
+      tableCache.set(key, []);
+      return [];
+    }
+  }
+  function closeAc() { acMenu.hidden = true; acRows = []; acSel = -1; }
+  function renderAc(items, onpick) {
+    clear(acMenu);
+    acRows = items;
+    if (!items.length) { closeAc(); return; }
+    items.forEach((item, i) => {
+      acMenu.append(el('div', {
+        class: `ac-item${i === acSel ? ' sel' : ''}`,
+        role: 'option',
+        onmousedown: (e) => { e.preventDefault(); onpick(item); },
+        onmouseenter: () => {
+          acSel = i;
+          for (const c of acMenu.children) c.classList.remove('sel');
+          acMenu.children[i]?.classList.add('sel');
         },
       },
-      '← Switch engine',
-    ),
-  );
+        el('span.ac-kind', { 'aria-hidden': 'true' }, item.kind === 'dataset' ? '⊞' : '▤'),
+        el('span.ac-name', item.label),
+        item.meta ? el('span.ac-meta', item.meta) : null));
+    });
+    acSel = 0;
+    acMenu.children[0]?.classList.add('sel');
+    acMenu.hidden = false;
+  }
+  async function refreshAc() {
+    const value = relInput.value;
+    const dotAt = value.indexOf('.');
+    if (dotAt === -1) {
+      const frag = value.trim().toLowerCase();
+      renderAc(
+        allowedDatasets()
+          .filter((d) => !frag || d.toLowerCase().includes(frag))
+          .map((d) => ({ kind: 'dataset', label: d, insert: `${d}.`, meta: 'dataset' })),
+        (item) => { relInput.value = item.insert; relInput.focus(); refreshAc(); });
+      return;
+    }
+    const dataset = value.slice(0, dotAt).trim();
+    const partial = value.slice(dotAt + 1).trim().toLowerCase();
+    if (!allowedDatasets().some((d) => d.toLowerCase() === dataset.toLowerCase())) { closeAc(); return; }
+    const names = await tablesIn(dataset);
+    const matches = names
+      .filter((n) => !partial || n.toLowerCase().includes(partial))
+      .slice(0, 40)
+      .map((n) => ({ kind: 'table', label: n, insert: `${dataset}.${n}`, meta: 'table' }));
+    if (!matches.length && !names.length) {
+      renderAc([{ kind: 'table', label: 'no tables available', insert: null, meta: 'BigQuery unreachable' }],
+        () => closeAc());
+      return;
+    }
+    renderAc(matches, (item) => { if (!item.insert) return; relInput.value = item.insert; closeAc(); relInput.focus(); });
+  }
+  relInput.addEventListener('input', refreshAc);
+  relInput.addEventListener('focus', refreshAc);
+  relInput.addEventListener('blur', () => setTimeout(closeAc, 120));
+  relInput.addEventListener('keydown', (e) => {
+    if (!acMenu.hidden && acRows.length) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        acSel = (acSel + (e.key === 'ArrowDown' ? 1 : -1) + acRows.length) % acRows.length;
+        for (const c of acMenu.children) c.classList.remove('sel');
+        acMenu.children[acSel]?.classList.add('sel');
+        acMenu.children[acSel]?.scrollIntoView({ block: 'nearest' });
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        const item = acRows[acSel];
+        if (item && item.insert) {
+          e.preventDefault();
+          relInput.value = item.insert;
+          if (item.kind === 'table') closeAc(); else refreshAc();
+          return;
+        }
+      }
+      if (e.key === 'Escape') { closeAc(); return; }
+    }
+    if (e.key === 'Enter') { e.preventDefault(); generate(); }
+  });
 
-  /* ------------------------------------------------------ ai settings --- */
+  /* ------------------------------------------------------- selectors --- */
 
+  const sourceSelect = el('select.select', { 'aria-label': 'Source' },
+    el('option', { value: 'model' }, 'A dbt model'),
+    el('option', { value: 'query' }, 'A query (SELECT)'),
+    el('option', { value: 'table' }, 'An existing table (declare as source)'));
+  sourceSelect.value = source;
+  sourceSelect.addEventListener('change', () => {
+    source = sourceSelect.value;
+    remembered.source = source;
+    paintSourceInput();
+    paintOptions();
+  });
+
+  const engineSelect = el('select.select', { 'aria-label': 'Descriptions' },
+    el('option', { value: 'pattern' }, 'Pattern descriptions (free)'),
+    el('option', { value: 'ai' }, 'AI descriptions (Gemini)'),
+    el('option', { value: 'none' }, 'No descriptions (schema only)'));
+  engineSelect.value = engine;
+  engineSelect.addEventListener('change', () => {
+    engine = engineSelect.value;
+    remembered.engine = engine;
+    paintOptions();
+  });
+
+  /* ------------------------------------------------------- options --- */
+
+  const profileToggle = checkbox('Profile the data', false,
+    'Reads null rates, cardinality and ranges so descriptions and tests are '
+    + 'evidence-based. Costs a small BigQuery scan; leave off for a free, '
+    + 'metadata-only draft.');
+  const testsToggle = checkbox('Suggest tests', true, 'Only proposes a test the data justifies.');
+  const samplesToggle = checkbox('Send sample values to Gemini', false,
+    'Off: only structure leaves your machine. On: also sends observed min/max '
+    + 'and frequent values. Improves AI descriptions; decide if acceptable.');
+
+  const sourceInputHost = el('div');
+  const optionsHost = el('div');
   const aiSettingsHost = el('div');
 
-  function paintAiSettings() {
-    if (!isAi) return clear(aiSettingsHost);
-
-    if (!aiStatus.sdk_available) {
-      return clear(aiSettingsHost).append(
-        callout('The google-genai package is unavailable', aiStatus.sdk_error, 'err'),
-      );
+  function paintSourceInput() {
+    if (source === 'model') {
+      clear(sourceInputHost).append(
+        el('div.field', el('label', 'Model'), el('div.mt', modelList)),
+        el('p.tiny.faint', { style: { lineHeight: '1.5', marginTop: '6px' } },
+          'Types come from the live table, so the model must have been built at least once.'));
+      paintModelList();
+    } else if (source === 'query') {
+      clear(sourceInputHost).append(
+        el('div.field', el('label', 'Model name for the YAML'), nameInput),
+        el('div.field.mt', el('label', 'Query'), sqlEditorInstance.node),
+        el('p.tiny.faint', { style: { lineHeight: '1.5' } },
+          'Planned with a dry run to read its output columns. Nothing is executed or billed.'));
+    } else {
+      clear(sourceInputHost).append(
+        el('div.field', el('label', 'Table to declare as a dbt source'),
+          el('p.tiny.faint', { style: { margin: '0 0 5px' } },
+            'Type dataset.table, e.g. ',
+            el('code', `${exampleDataset}.bronze_workspace_analytics_combined`),
+            '. Autocomplete suggests datasets, then tables after the dot.'),
+          relWrap),
+        el('p.tiny.faint', { style: { lineHeight: '1.5' } },
+          'This is the only source that produces a dbt sources: block - the '
+          + 'declaration that makes dbt aware of a table it did not build.'));
     }
+  }
 
-    if (!aiStatus.configured) return clear(aiSettingsHost).append(keySetupPanel());
+  function paintOptions() {
+    const isAi = engine === 'ai';
+    const showProfile = engine !== 'none' || testsToggle.checked;
+    clear(optionsHost).append(
+      el('div.stat-label.mb', 'Options'),
+      el('div.grid', { style: { gap: '7px' } },
+        profileToggle.node,
+        testsToggle.node,
+        isAi ? samplesToggle.node : null),
+    );
+    clear(aiSettingsHost);
+    if (isAi) aiSettingsHost.append(paintAiSettings());
+    paintGenerateBtn();
+  }
+
+  /* ------------------------------------------------------- AI settings --- */
+
+  function paintAiSettings() {
+    if (!aiStatus.sdk_available) {
+      return callout('The google-genai package is unavailable', aiStatus.sdk_error || '', 'err');
+    }
+    if (!aiStatus.configured) return keySetupPanel();
 
     const modelSelect = el('select.select');
     for (const option of aiStatus.models || []) {
-      modelSelect.append(
-        el(
-          'option',
-          { value: option.id, selected: option.id === aiModel },
-          `${option.label}${option.recommended ? ' (recommended)' : ''}`,
-        ),
-      );
+      modelSelect.append(el('option',
+        { value: option.id, selected: option.id === aiModel },
+        `${option.label}${option.recommended ? ' (recommended)' : ''}`));
     }
-    modelSelect.addEventListener('change', () => {
-      aiModel = modelSelect.value;
-      paintAiSettings();
-    });
-
-    const active = (aiStatus.models || []).find((option) => option.id === aiModel);
-
-    clear(aiSettingsHost).append(
-      el(
-        'div',
-        el('div.field', el('label', 'Model'), modelSelect),
-        active
-          ? el(
-              'p.tiny.faint',
-              { style: { margin: '5px 0 0', lineHeight: '1.5' } },
-              `${active.blurb} Free tier: ${num(active.free_rpd)} requests/day, ${active.free_rpm}/min. ` +
-                'One table costs one request.',
-            )
-          : null,
-        el(
-          'div.row.between.mt',
-          el('span.tiny.faint', `key ${aiStatus.key_masked} · ${aiStatus.key_source}`),
-          el('button.btn.btn-tiny', { onclick: () => showKeyEditor() }, 'Change key'),
-        ),
-      ),
-    );
-  }
-
-  function showKeyEditor() {
-    clear(aiSettingsHost).append(keySetupPanel(true));
+    modelSelect.addEventListener('change', () => { aiModel = modelSelect.value; });
+    return el('div.mt',
+      el('div.field', el('label', 'Gemini model'), modelSelect),
+      el('div.row.between.mt',
+        el('span.tiny.faint', `key ${aiStatus.key_masked} · ${aiStatus.key_source}`),
+        el('button.btn.btn-tiny', { onclick: () => { clear(aiSettingsHost).append(keySetupPanel(true)); } }, 'Change key')));
   }
 
   function keySetupPanel(isChange = false) {
-    const input = el('input.input', {
-      type: 'password',
-      placeholder: 'AIza…',
-      autocomplete: 'off',
-      spellcheck: 'false',
-    });
+    const input = el('input.input', { type: 'password', placeholder: 'AIza…', autocomplete: 'off', spellcheck: 'false' });
     const status = el('div');
-
     async function save() {
       const key = input.value.trim();
-      if (!key) {
-        toast('Paste the key first.', { kind: 'warn' });
-        return;
-      }
+      if (!key) { toast('Paste the key first.', { kind: 'warn' }); return; }
       clear(status).append(loading('Saving…'));
       try {
         const result = await api.saveAiKey(key);
-        aiStatus = result.status;
-        state.boot.ai = result.status;
+        aiStatus = result.status; state.boot.ai = result.status;
         toast('Key saved. AI documentation is ready.', { kind: 'ok' });
-        paintAiSettings();
+        clear(aiSettingsHost).append(paintAiSettings());
       } catch (error) {
-        clear(status).append(
-          callout('Could not save the key', error.message, 'err',
-            error.detail ? el('pre.code-block', error.detail) : null),
-        );
+        clear(status).append(callout('Could not save the key', error.message, 'err'));
       }
     }
-
-    async function clearKey() {
-      try {
-        const result = await api.clearAiKey();
-        aiStatus = result.status;
-        state.boot.ai = result.status;
-        toast('Key removed.', { kind: 'ok' });
-        paintAiSettings();
-      } catch (error) {
-        toast(error.message, { kind: 'err' });
-      }
-    }
-
-    return el(
-      'div',
-      callout(
-        isChange ? 'Replace the Gemini API key' : 'AI documentation needs a free API key',
-        '',
-        'info',
-        el(
-          'div',
-          el(
-            'ol',
-            { style: { margin: '6px 0', paddingLeft: '18px', lineHeight: '1.75' } },
-            el(
-              'li.small',
-              'Open ',
-              el(
-                'a',
-                { href: aiStatus.signup_url || 'https://aistudio.google.com/apikey', target: '_blank', rel: 'noopener' },
-                'aistudio.google.com/apikey',
-              ),
-              ' and sign in with your Google account.',
-            ),
-            el('li.small', 'Click Create API key. No credit card and no GCP project permissions are needed.'),
-            el('li.small', 'Copy the key and paste it below.'),
-          ),
-        ),
-      ),
+    return el('div.mt',
+      callout(isChange ? 'Replace the Gemini API key' : 'AI needs a free Gemini key', '', 'info',
+        el('p.small', { style: { margin: '4px 0 0', lineHeight: '1.6' } },
+          'Get one free at ',
+          el('a', { href: 'https://aistudio.google.com/apikey', target: '_blank', rel: 'noopener' }, 'aistudio.google.com/apikey'),
+          ' - no credit card, no GCP admin.')),
       el('div.field.mt', el('label', 'Gemini API key'), input,
-        el('span.hint', 'Stored in dbt_ui/.runtime/ai.json, which is gitignored. Never sent anywhere except Google.')),
-      el(
-        'div.row.mt',
-        { style: { gap: '7px' } },
+        el('span.hint', 'Stored in dbt_ui/.runtime/ai.json (gitignored).')),
+      el('div.row.mt', { style: { gap: '7px' } },
         el('button.btn.btn-primary', { onclick: save }, 'Save key'),
-        aiStatus.configured ? el('button.btn.btn-danger', { onclick: clearKey }, 'Remove') : null,
-        isChange
-          ? el('button.btn', { onclick: () => paintAiSettings() }, 'Cancel')
-          : null,
-      ),
-      el('div.mt', status),
-      aiStatus.vertex_note
-        ? el(
-            'details.mt',
-            el('summary.tiny.faint', { style: { cursor: 'pointer' } }, 'Why not use our GCP project instead?'),
-            el('p.tiny.faint', { style: { lineHeight: '1.6' } }, aiStatus.vertex_note),
-          )
-        : null,
-    );
+        isChange ? el('button.btn', { onclick: () => { clear(aiSettingsHost).append(paintAiSettings()); } }, 'Cancel') : null),
+      el('div.mt', status));
   }
 
-  /* ------------------------------------------------------------ picker --- */
+  /* ------------------------------------------------------- generate --- */
 
-  const modelList = el('div.scroll-list');
-
-  function paintList() {
-    clear(modelList);
-    const models = state.models || [];
-    const inScope = models.filter((m) => m.in_scope !== false);
-    const blocked = models.filter((m) => m.in_scope === false);
-
-    for (const model of [...inScope, ...blocked]) {
-      const outOfScope = model.in_scope === false;
-      modelList.append(
-        el(
-          'button',
-          {
-            class: `list-btn${model.name === selected && mode === 'model' ? ' sel' : ''}${outOfScope ? ' out-of-scope' : ''}`,
-            dataset: { name: model.name.toLowerCase() },
-            title: outOfScope
-              ? `Outside the permitted scope (dataset ${model.dataset})`
-              : model.name,
-            onclick: () => {
-              if (outOfScope) {
-                toast(`${model.name} is outside the permitted dataset scope.`, {
-                  kind: 'warn',
-                  detail:
-                    `It lives in '${model.dataset}'. This instance may only ` +
-                    `document: ${(state.scope?.allowed_datasets || []).join(', ')}.`,
-                });
-                return;
-              }
-              selected = model.name;
-              state.scratch.schemaModel = model.name;
-              mode = 'model';
-              paintList();
-              paintSource();
-              generate();
-            },
-          },
-          layerChip(model.layer),
-          el('span.lb-name', model.name),
-          el(
-            'span.lb-meta',
-            outOfScope
-              ? el('span.chip.err', 'out of scope')
-              : model.has_description
-              ? el('span.chip.ok', `${model.documented_columns}/${model.column_count}`)
-              : el('span.chip.warn', 'undoc'),
-          ),
-        ),
-      );
-    }
+  const generateBtn = el('button.btn.btn-primary.btn-block');
+  function paintGenerateBtn() {
+    clear(generateBtn);
+    generateBtn.textContent = engine === 'ai' ? '✦ Generate with Gemini'
+      : source === 'table' ? '⚙ Read table & draft source'
+      : '⚙ Generate documentation';
+    generateBtn.onclick = () => generate();
   }
-
-  const sourceHost = el('div');
-
-  function paintSource() {
-    clear(sourceHost).append(
-      mode === 'model'
-        ? el(
-            'div',
-            el('div.field', el('label', 'Source'),
-              el('p.small.mono', { style: { margin: 0 } }, selected || 'none selected')),
-            el(
-              'p.tiny.faint',
-              { style: { lineHeight: '1.5' } },
-              'Types are read from the live table definition, so the model must have been built at least once.',
-            ),
-          )
-        : el(
-            'div',
-            el('div.field', el('label', 'Model name for the YAML'), nameInput),
-            el('div.field.mt', el('label', 'Query'), sqlEditorInstance.node),
-            el(
-              'p.tiny.faint',
-              { style: { lineHeight: '1.5' } },
-              'The statement is planned with a dry run to read its output schema. Nothing is executed and nothing is billed.',
-            ),
-          ),
-    );
-  }
-
-  const modeTabs = el('div.row', { style: { gap: '6px' } });
-
-  function paintModeTabs() {
-    clear(modeTabs).append(
-      modeButton('From a model', 'model'),
-      modeButton('From a query', 'sql'),
-    );
-  }
-
-  function modeButton(label, key) {
-    return el(
-      'button',
-      {
-        class: `btn btn-tiny${mode === key ? ' btn-primary' : ''}`,
-        onclick: () => {
-          mode = key;
-          paintModeTabs();
-          paintList();
-          paintSource();
-        },
-      },
-      label,
-    );
-  }
-
-  /* ---------------------------------------------------------- generate --- */
 
   async function generate() {
-    if (isAi && !aiStatus.configured) {
-      clear(output).append(
-        el('div.panel', el('div.panel-body',
-          callout('Add the API key first', 'AI documentation needs a Gemini key. The panel on the left walks through it.', 'warn'))),
-      );
+    if (engine === 'ai' && !aiStatus.configured) {
+      clear(output).append(el('div.panel', el('div.panel-body',
+        callout('Add the API key first', 'Set a Gemini key in the panel on the left, or pick Pattern / None.', 'warn'))));
       return;
     }
-    if (mode === 'model' && !selected) {
-      toast('Pick a model first.', { kind: 'warn' });
-      return;
+
+    const includeDescriptions = engine !== 'none';
+    const body = {
+      include_tests: testsToggle.checked,
+      include_descriptions: includeDescriptions,
+      engine: engine === 'ai' ? 'ai' : 'pattern',
+    };
+    if (engine === 'ai') { body.ai_model = aiModel; body.send_sample_values = samplesToggle.checked; }
+
+    let call;
+    if (source === 'model') {
+      if (!selected) { toast('Pick a model first.', { kind: 'warn' }); return; }
+      body.model = selected;
+      body.profile = profileToggle.checked;
+      call = api.generateSchema(body);
+    } else if (source === 'query') {
+      const sql = sqlEditorInstance.value.trim();
+      if (!sql) { toast('Write a query first.', { kind: 'warn' }); return; }
+      body.sql = sql;
+      body.name = nameInput.value.trim() || 'my_new_model';
+      call = api.generateSchema(body);
+    } else {
+      const relation = relInput.value.trim();
+      if (!relation) { toast(`Type a table, e.g. ${exampleDataset}.my_table`, { kind: 'warn' }); return; }
+      body.relation = relation;
+      body.profile = profileToggle.checked;
+      call = api.generateSource(body);
     }
 
     generateBtn.disabled = true;
-    clear(output).append(
-      el(
-        'div.panel',
-        loading(
-          isAi
-            ? `Profiling, then asking ${aiModel} to write the descriptions…`
-            : profileToggle.checked
-            ? 'Reading types and profiling the data…'
-            : 'Reading column types…',
-        ),
-      ),
-    );
-
-    const body = {
-      engine,
-      include_tests: testsToggle.checked,
-      include_descriptions: docsToggle.checked,
-    };
-    if (isAi) {
-      body.ai_model = aiModel;
-      body.send_sample_values = samplesToggle.checked;
-    }
-
-    if (mode === 'model') {
-      body.model = selected;
-      body.profile = profileToggle.checked;
-    } else {
-      body.sql = sqlEditorInstance.value;
-      body.name = nameInput.value.trim() || 'my_new_model';
-    }
+    clear(output).append(el('div.panel', loading(
+      source === 'table' ? 'Reading the table schema from BigQuery…'
+        : engine === 'ai' ? `Asking ${aiModel} to write the descriptions…`
+        : profileToggle.checked ? 'Reading types and profiling…' : 'Reading column types…')));
 
     try {
-      paintOutput(await api.generateSchema(body));
+      const payload = await call;
+      if (source === 'table') paintOutput(payload, { kind: 'source' });
+      else paintOutput(payload, { kind: 'model' });
     } catch (error) {
       paintFailure(error);
     } finally {
@@ -618,570 +424,340 @@ function generator(navigate, params, engine) {
 
   function paintFailure(error) {
     const kind = error.payload?.kind;
-    const fixable = error.payload?.fixable;
-
-    clear(output).append(
-      el(
-        'div.panel',
-        el(
-          'div.panel-body',
-          callout(
-            kind === 'quota'
-              ? 'Free-tier quota reached'
-              : kind === 'not_configured'
-              ? 'No API key configured'
-              : kind === 'bad_key'
-              ? 'The API key was rejected'
-              : 'Could not generate the documentation',
-            error.message,
-            'err',
-            el(
-              'div',
-              error.detail ? el('pre.code-block', error.detail) : null,
-              fixable && isAi
-                ? el(
-                    'div.row.wrap.mt',
-                    { style: { gap: '7px' } },
-                    el(
-                      'button.btn.btn-tiny',
-                      {
-                        onclick: () => {
-                          chosenEngine = 'pattern';
-                          navigate('schema', { engine: 'pattern', model: selected });
-                        },
-                      },
-                      'Use pattern documentation instead',
-                    ),
-                    kind === 'quota'
-                      ? el(
-                          'button.btn.btn-tiny',
-                          {
-                            onclick: () => {
-                              aiModel = 'gemini-2.5-flash-lite';
-                              paintAiSettings();
-                              generate();
-                            },
-                          },
-                          'Retry with Flash-Lite (1,000/day)',
-                        )
-                      : null,
-                  )
-                : null,
-              mode === 'model' && !kind
-                ? el(
-                    'div.mt',
-                    el('span.small.faint', 'If the model has never been built there is no table to read types from. '),
-                    el(
-                      'button.btn.btn-tiny',
-                      { onclick: () => navigate('runs', { select: selected, autorun: 'run' }) },
-                      `⚡ Build ${selected}`,
-                    ),
-                  )
-                : null,
-            ),
-          ),
-        ),
-      ),
-    );
+    clear(output).append(el('div.panel', el('div.panel-body',
+      callout(
+        kind === 'quota' ? 'Free-tier quota reached'
+          : error.status === 404 ? 'Not found'
+          : 'Could not generate the documentation',
+        error.message, 'err',
+        el('div',
+          error.detail ? el('pre.code-block', error.detail) : null,
+          source === 'model' && !kind
+            ? el('div.mt',
+                el('span.small.faint', 'If the model was never built there is no table to read. '),
+                el('button.btn.btn-tiny', { onclick: () => navigate('runs', { select: selected, autorun: 'run' }) }, `⚡ Build ${selected}`))
+            : source === 'table'
+            ? el('p.tiny.faint', { style: { marginTop: '8px', lineHeight: '1.6' } },
+                'Give it as dataset.table. Must be in: ' + (state.boot?.scope?.allowed_datasets || []).join(', '))
+            : null)))));
   }
 
-  /* ------------------------------------------------------------ output --- */
+  /* ======================================================================
+     the editable proposal - shared by every source
+     ====================================================================== */
 
-  function paintOutput(payload) {
+  function paintOutput(payload, { kind }) {
+    const isSource = kind === 'source';
     const columns = payload.columns || [];
-    const contract = columnContract(columns);
     const review = payload.stats?.needs_review || [];
-    const profiled = columns.some((column) => column.profile);
+    const profiled = columns.some((c) => c.profile);
     const ai = payload.ai;
+    const contract = columnContract(columns);
+    const defaultPath = isSource
+      ? (payload.suggested_path || 'models/_sources.yml')
+      : (payload.suggested_path || `models/_${payload.name}.yml`);
 
-    const view = tabs([
-      {
-        label: 'Contract',
-        count: columns.length,
-        render: () =>
-          el(
-            'div',
-            el(
-              'div.panel-body',
-              el(
-                'div.row.wrap.mb',
-                { style: { gap: '6px' } },
-                el('span.chip.info', payload.name),
-                el('span.chip', `${columns.length} columns`),
-                el('span.chip.ok', `${payload.stats.documented} documented`),
-                review.length ? el('span.chip.warn', `${review.length} need review`) : null,
-                profiled ? el('span.chip', 'profiled') : null,
-                ai ? el('span.chip.info', ai.model_label) : el('span.chip', 'pattern rules'),
-              ),
-              ai ? aiUsageNote(ai) : null,
-              review.length
-                ? callout(
-                    `${review.length} description${review.length === 1 ? '' : 's'} need a human`,
-                    isAi
-                      ? `The model was not confident about: ${review.join(', ')}. Those start with "Unclear:" in the YAML.`
-                      : `The rules could not infer meaning for: ${review.join(', ')}. They are marked TODO in the YAML.`,
-                    'warn',
-                  )
-                : callout('Every column has a description', 'Review them, then commit.', 'ok'),
-            ),
-            schemaTable(columns, { showProfile: profiled, showDescription: true }),
-          ),
-      },
-      {
-        label: 'name + data_type',
-        render: () =>
-          el(
-            'div.panel-body',
-            callout(
-              'The bare contract',
-              'Just the column names and their data types. This is the format to hand to whoever builds the next layer.',
-              'info',
-            ),
-            el(
-              'div.row.wrap.mt.mb',
-              { style: { gap: '7px' } },
-              el('button.btn.btn-tiny', { onclick: () => copy(contract, 'Contract copied') }, '⧉ Copy'),
-              el(
-                'button.btn.btn-tiny',
-                { onclick: () => download(`${payload.name}_columns.yml`, contract, 'text/yaml') },
-                '↓ Download',
-              ),
-            ),
-            codeBlock(contract, { language: 'yaml', title: `${columns.length} columns` }),
-          ),
-      },
-      { label: 'Full schema YAML', render: () => yamlPanel(payload, navigate) },
-      {
-        label: 'Markdown',
-        render: () =>
-          el(
-            'div.panel-body',
-            el('p.small.faint', { style: { marginTop: 0 } }, 'For a PR description or a Confluence page.'),
-            el(
-              'div.row.wrap.mb',
-              { style: { gap: '7px' } },
-              el('button.btn.btn-tiny', { onclick: () => copy(payload.markdown, 'Markdown copied') }, '⧉ Copy'),
-              el(
-                'button.btn.btn-tiny',
-                { onclick: () => download(`${payload.name}.md`, payload.markdown, 'text/markdown') },
-                '↓ Download',
-              ),
-            ),
-            el('pre.code-block.tall', payload.markdown),
-          ),
-      },
-    ]);
+    let rebuildTimer = null;
+    const yamlSlots = [];
+    const saveState = el('span.tiny.faint.save-hint');
+    let lastWrittenPath = null;   // enables the register-with-dbt step for sources
+    const setStatus = (label, detail = '') => { saveState.textContent = label; saveState.title = detail || label; };
+    const registerYaml = (fn) => { yamlSlots.push(fn); fn(); };
 
-    clear(output).append(el('div.panel', view.node));
+    async function rebuildNow() {
+      try {
+        const descriptions = Object.fromEntries(columns.map((c) => [c.name, c.description || '']));
+        const profiles = Object.fromEntries(columns.filter((c) => c.profile).map((c) => [c.name, c.profile]));
+        const result = isSource
+          ? await api.rebuildSource({
+              source_name: payload.source_name, database: payload.database,
+              schema: payload.schema, table: payload.name,
+              columns, descriptions, include_tests: testsToggle.checked, profiles,
+              include_descriptions: engine !== 'none',
+            })
+          : await api.rebuildSchema({
+              name: payload.name, columns, descriptions,
+              resource_type: payload.table?.resource_type || 'model',
+              include_tests: testsToggle.checked, include_descriptions: engine !== 'none', profiles,
+            });
+        payload.yaml = result.yaml;
+        payload.markdown = result.markdown;
+        if (result.stats) payload.stats = result.stats;
+        for (const fn of yamlSlots) fn();
+      } catch (error) {
+        toast('Could not rebuild the YAML from your edits', { kind: 'err', detail: error.message });
+      }
+    }
+    const scheduleRebuild = () => { clearTimeout(rebuildTimer); rebuildTimer = setTimeout(rebuildNow, 400); };
+    const flushEdits = async () => { clearTimeout(rebuildTimer); await rebuildNow(); };
+
+    function editableTable() {
+      const rows = columns.map((column) => {
+        const profile = column.profile;
+        const cell = el('div', {
+          class: 'doc-cell', contenteditable: 'plaintext-only', role: 'textbox',
+          'aria-multiline': 'true', 'aria-label': `Description for ${column.name}`, spellcheck: 'true',
+        });
+        cell.textContent = column.description || '';
+        cell.addEventListener('input', () => {
+          if (cell.querySelector('*')) cell.textContent = cell.textContent;
+          column.description = cell.textContent.replace(/\s+/g, ' ').trim();
+          cell.classList.add('is-dirty');
+          setStatus('edited…', 'Rebuilding the YAML from your edits');
+          scheduleRebuild();
+        });
+        cell.addEventListener('blur', () => cell.classList.remove('is-dirty'));
+        return el('tr',
+          el('td.mono', column.name),
+          el('td', typeBadge(column.data_type, column.category)),
+          el('td.small.faint', column.mode === 'REQUIRED' ? el('span.chip.info', 'required') : (column.mode || 'NULLABLE').toLowerCase()),
+          profiled ? el('td.num', profile?.null_pct == null ? '-' : pct(profile.null_pct)) : null,
+          profiled ? el('td.num', num(profile?.distinct_count)) : null,
+          profiled ? el('td.small.mono.faint', profile?.min == null ? '-'
+            : el('span.cell-clip', { title: `${profile.min} … ${profile.max}` }, `${profile.min} … ${profile.max}`)) : null,
+          el('td', { style: { minWidth: '26ch' } }, cell));
+      });
+      return el('div.table-wrap', { style: { maxHeight: '56vh' } },
+        el('table.data.compact.doc-table',
+          el('thead', el('tr',
+            el('th', 'Column'), el('th', 'data_type'), el('th', 'Mode'),
+            profiled ? el('th', 'Null %') : null,
+            profiled ? el('th', 'Distinct') : null,
+            profiled ? el('th', 'Range') : null,
+            el('th', 'Description'))),
+          el('tbody', ...rows)));
+    }
+
+    /* ---- register with dbt (sources only) ---- */
+    const registerHost = el('div.mt');
+    function paintRegister() {
+      clear(registerHost);
+      if (!isSource || !lastWrittenPath) return;
+      const btn = el('button.btn.btn-tiny.btn-primary', {
+        disabled: !canRunDbt,
+        title: canRunDbt ? '' : 'Only a Manager can run dbt commands',
+        onclick: () => registerWithDbt(),
+      }, '↻ Register with dbt (parse + docs)');
+      registerHost.append(callout(
+        'Saved. Now register it with dbt',
+        'dbt does not know about this table until it re-parses. Registering runs '
+        + 'dbt parse (so the source is recognised) then dbt docs generate (so it '
+        + 'appears in the docs site with lineage). Both are free.',
+        'ok',
+        el('div.row.wrap.mt', { style: { gap: '7px' } },
+          btn,
+          el('a.btn.btn-tiny', { href: '/dbt-docs', target: '_blank', rel: 'noopener' }, 'Open dbt docs ↗'),
+          canRunDbt ? null : el('span.tiny.faint', { style: { alignSelf: 'center' } },
+            'A Manager must run it.'))));
+    }
+    async function registerWithDbt() {
+      const dismiss = toast('dbt parse…', { kind: 'info', timeout: 60000 });
+      try {
+        const { job } = await api.dbtRun({ command: 'parse' });
+        watchJob(job.id, {
+          onDone: async (parseJob) => {
+            if (!(parseJob?.status === 'success' || parseJob?.exit_code === 0)) {
+              dismiss();
+              toast('dbt parse failed - check the Run Console.', { kind: 'warn' });
+              return;
+            }
+            const gen = await api.dbtRun({ command: 'docs' });
+            watchJob(gen.job.id, {
+              onDone: (docsJob) => {
+                dismiss();
+                const ok = docsJob?.status === 'success' || docsJob?.exit_code === 0;
+                toast(ok ? 'Registered. dbt now documents this table.'
+                  : 'dbt docs generate had errors - check the Run Console.',
+                  { kind: ok ? 'ok' : 'warn' });
+              },
+            });
+          },
+        });
+      } catch (error) {
+        dismiss();
+        toast(error.status === 403 ? 'Only a Manager can run dbt' : 'Could not register',
+          { kind: 'err', detail: error.message });
+      }
+    }
+
+    /* ---- header chips + tabs ---- */
+    const engineChip = ai ? el('span.chip.info', ai.model_label)
+      : engine === 'none' ? el('span.chip', 'no descriptions')
+      : el('span.chip', 'pattern rules');
+
+    const contractTab = {
+      label: isSource ? 'Source' : 'Contract',
+      count: columns.length,
+      render: () => el('div',
+        el('div.panel-body',
+          el('div.row.wrap.mb', { style: { gap: '6px' } },
+            el('span.chip.info', isSource ? payload.reference : payload.name),
+            el('span.chip', `${columns.length} columns`),
+            engine !== 'none' ? el('span.chip.ok', `${payload.stats.documented} documented`) : null,
+            review.length ? el('span.chip.warn', `${review.length} need review`) : null,
+            profiled ? el('span.chip', 'profiled') : null,
+            engineChip),
+          ai ? aiUsageNote(ai) : null,
+          engine === 'none'
+            ? callout('Schema only', 'Descriptions are left as TODO for a human to fill in. Edit them below or after saving.', 'info')
+            : review.length
+              ? callout(`${review.length} need a human`,
+                  `Not confident about: ${review.join(', ')}. Marked in the YAML.`, 'warn')
+              : callout('Every column has a description', 'Click any description to edit it, then Save.', 'ok'),
+          el('div.row.wrap.mt', { style: { gap: '7px' } },
+            el('button.btn.btn-tiny', { onclick: () => download(`${payload.name}_documentation.csv`, documentationCsv(payload.name, columns), 'text/csv') }, '↓ CSV'),
+            el('button.btn.btn-tiny', { onclick: () => copy(documentationCsv(payload.name, columns), 'Copied as CSV') }, '⧉ Copy CSV'))),
+        editableTable(),
+        registerHost),
+    };
+
+    const bareTab = {
+      label: 'name + data_type',
+      render: () => el('div.panel-body',
+        callout('The bare contract', 'Just names and data types, to hand to the next layer.', 'info'),
+        el('div.row.wrap.mt.mb', { style: { gap: '7px' } },
+          el('button.btn.btn-tiny', { onclick: () => copy(contract, 'Copied') }, '⧉ Copy'),
+          el('button.btn.btn-tiny', { onclick: () => download(`${payload.name}_columns.yml`, contract, 'text/yaml') }, '↓ Download')),
+        codeBlock(contract, { language: 'yaml', title: `${columns.length} columns` })),
+    };
+
+    const yamlTab = {
+      label: isSource ? 'sources: YAML' : 'Full schema YAML',
+      render: () => {
+        const panel = el('div.panel-body');
+        registerYaml(() => clear(panel).append(
+          el('p.small.faint', { style: { marginTop: 0 } },
+            isSource ? 'The dbt source declaration. Save it below, then Register with dbt.'
+              : 'The dbt schema block. Save it below into your models folder.'),
+          codeBlock(payload.yaml, { language: 'yaml', tall: true })));
+        return panel;
+      },
+    };
+
+    const mdTab = {
+      label: 'Markdown',
+      render: () => {
+        const body = el('pre.code-block.tall');
+        registerYaml(() => { body.textContent = payload.markdown; });
+        return el('div.panel-body',
+          el('p.small.faint', { style: { marginTop: 0 } }, 'For a PR description or a wiki page.'),
+          el('div.row.wrap.mb', { style: { gap: '7px' } },
+            el('button.btn.btn-tiny', { onclick: () => copy(payload.markdown, 'Copied') }, '⧉ Copy'),
+            el('button.btn.btn-tiny', { onclick: () => download(`${payload.name}.md`, payload.markdown, 'text/markdown') }, '↓ Download')),
+          body);
+      },
+    };
+
+    const view = tabs(isSource ? [contractTab, yamlTab, mdTab] : [contractTab, bareTab, yamlTab, mdTab]);
+
+    /* ---- save + download bar ---- */
+    const pathInput = el('input.input.input-tiny', { value: defaultPath, title: 'Path to write', style: { width: '24ch' } });
+    const saveBtn = el('button.btn.btn-primary.btn-tiny', {
+      disabled: !canWrite, title: canWrite ? '' : 'Only a Manager can write files',
+      onclick: () => doSave(isSource ? 'append' : 'overwrite'),
+    }, '⤓ Save');
+
+    async function doSave(mode) {
+      const path = pathInput.value.trim();
+      if (!path) { toast('Give the file a path.', { kind: 'warn' }); return; }
+      setStatus('saving…'); saveBtn.disabled = true;
+      try {
+        await flushEdits();
+        const result = await api.writeFile(path, payload.yaml, mode);
+        setStatus(result.backup ? 'saved · backup kept' : 'saved',
+          result.backup ? `Wrote ${result.written}\nBackup: ${result.backup}` : `Wrote ${result.written}`);
+        toast(`Wrote ${result.written}`, { kind: 'ok',
+          detail: isSource ? 'Now register it with dbt below.' : 'Refresh the manifest so dbt picks it up.' });
+        lastWrittenPath = result.written;
+        paintRegister();
+      } catch (error) {
+        setStatus('save failed', error.message);
+        toast('Could not save', { kind: 'err', detail: error.message });
+      } finally {
+        saveBtn.disabled = false;
+      }
+    }
+
+    function downloadAs(format) {
+      const n = payload.name;
+      if (format === 'csv') download(`${n}_documentation.csv`, documentationCsv(n, columns), 'text/csv');
+      else if (format === 'yaml') download(`${n}${isSource ? '_source' : ''}.yml`, payload.yaml, 'text/yaml');
+      else if (format === 'markdown') download(`${n}.md`, payload.markdown, 'text/markdown');
+      else if (format === 'json') {
+        const doc = { model: n, columns: columns.map((c) => ({ name: c.name, data_type: String(c.data_type || '').toLowerCase(), description: c.description || '' })) };
+        download(`${n}.json`, JSON.stringify(doc, null, 2), 'application/json');
+      }
+    }
+    const downloadList = el('div.download-menu', { hidden: true },
+      ...[['yaml', 'YAML (.yml)'], ['csv', 'CSV (.csv)'], ['markdown', 'Markdown (.md)'], ['json', 'JSON (.json)']].map(
+        ([k, label]) => el('button.download-item', { type: 'button', onclick: () => { downloadList.hidden = true; downloadAs(k); } }, label)));
+    const downloadBtn = el('button.btn.btn-tiny.btn-icon', {
+      type: 'button', title: 'Download', 'aria-label': 'Download', 'aria-haspopup': 'menu',
+      onclick: (e) => {
+        e.stopPropagation();
+        const show = downloadList.hidden;
+        downloadList.hidden = !show;
+        if (show) setTimeout(() => document.addEventListener('click', () => { downloadList.hidden = true; }, { once: true }), 0);
+      },
+    }, downloadIconSvg());
+    const downloadMenu = el('div.download-wrap', downloadBtn, downloadList);
+
+    const actionBar = el('div.output-actions',
+      saveState, downloadMenu, pathInput,
+      el('button.btn.btn-tiny', { disabled: !canWrite, onclick: () => doSave(isSource ? 'overwrite' : 'append') },
+        isSource ? '⤓ Overwrite' : '+ Append'),
+      saveBtn);
+
+    const tabsWrap = view.node;
+    const bar = tabsWrap.querySelector('.tabs');
+    const panels = tabsWrap.querySelector('.tab-panels');
+    clear(tabsWrap).append(el('div.output-head-row', bar, actionBar), panels);
+    clear(output).append(el('div.panel', tabsWrap));
   }
 
   function aiUsageNote(ai) {
     const usage = ai.usage || {};
-    return el(
-      'p.tiny.faint',
-      { style: { margin: '0 0 10px', lineHeight: '1.5' } },
-      `${ai.model_label} · ${usage.requests || 1} request${(usage.requests || 1) === 1 ? '' : 's'} · ` +
-        `${num(usage.prompt_tokens)} tokens in, ${num(usage.output_tokens)} out` +
-        (ai.missing?.length ? ` · ${ai.missing.length} column(s) got no description and fell back to the pattern rules` : ''),
-    );
+    return el('p.tiny.faint', { style: { margin: '0 0 10px', lineHeight: '1.5' } },
+      `${ai.model_label} · ${usage.requests || 1} request${(usage.requests || 1) === 1 ? '' : 's'} · `
+      + `${num(usage.prompt_tokens)} tokens in, ${num(usage.output_tokens)} out`
+      + (ai.missing?.length ? ` · ${ai.missing.length} column(s) fell back to pattern rules` : ''));
   }
 
-  /* ---------------------------------------------------------- assemble --- */
+  /* ------------------------------------------------------- assemble --- */
 
-  paintList();
-  paintSource();
-  paintModeTabs();
-  paintAiSettings();
+  paintSourceInput();
+  paintOptions();
 
   host.append(
-    engineBar,
-    el(
-      'div.split',
-      el(
-        'div.panel',
-        el('div.panel-head', el('h3', 'Source'), modeTabs),
-        el(
-          'div.panel-body',
-          sourceHost,
-          isAi ? el('div.mt', aiSettingsHost) : null,
+    el('div.split',
+      el('div.panel',
+        el('div.panel-head', el('h3', 'Documentation')),
+        el('div.panel-body',
+          el('div.field.mb', el('label', 'Source'), sourceSelect),
+          el('div.field.mb', el('label', 'Descriptions'), engineSelect),
+          sourceInputHost,
+          aiSettingsHost,
           el('div.mt'),
-          el('div.stat-label.mb', 'Options'),
-          el(
-            'div.grid',
-            { style: { gap: '7px' } },
-            profileToggle.node,
-            testsToggle.node,
-            docsToggle.node,
-            isAi ? samplesToggle.node : null,
-          ),
+          optionsHost,
           el('div.mt', generateBtn),
-        ),
-      ),
-      el(
-        'div',
-        el('div.panel', el('div.panel-head', el('h3', 'Models')), el('div.panel-body', modelList)),
-        output,
-      ),
-    ),
+          el('p.tiny.faint', { style: { marginBottom: 0, lineHeight: '1.6' } },
+            'dbt has no description engine of its own, so the prose is written '
+            + 'by the Pattern rules or Gemini. "An existing table" produces a dbt '
+            + 'sources: block and lets dbt register and document it.'))),
+      output),
   );
 
-  clear(output).append(
-    el(
-      'div.panel',
-      emptyState(
-        isAi ? 'Ready to generate with Gemini' : 'Pick a model, then generate',
-        isAi
-          ? 'Choose a model on the right. Its columns and profile go to Gemini in one request, and you get back a description for every column plus the schema YAML.'
-          : 'You get the real BigQuery data type for every column, a rule-drafted description, and a schema YAML block ready to commit.',
-      ),
-    ),
-  );
+  clear(output).append(el('div.panel', emptyState(
+    'Pick a source, then generate',
+    'Choose a model, a query, or an existing table on the left. You get the real '
+    + 'column types, drafted descriptions, and an editable YAML ready to commit.')));
 
-  if ((selected || params.sql) && (!isAi || aiStatus.configured)) generate();
+  /* Auto-run when we arrived with something already selected. */
+  if (source === 'model' && selected && (engine !== 'ai' || aiStatus.configured)) generate();
+  else if (source === 'query' && params.sql) generate();
+  else if (source === 'table' && params.relation) generate();
 
   return host;
-}
-
-/* ======================================================================
-   editor - revise the descriptions already committed to the project
-   ====================================================================== */
-
-/* app.js tears a view down with clear(main), which drops the nodes but cannot
-   stop a pending autosave timer. Holding the live instance here lets the next
-   render flush and cancel the previous one. */
-let liveEditor = null;
-
-function editor(navigate, params = {}) {
-  const host = el('div');
-  const editorHost = el('div');
-  const statusHost = el('div');
-  const exportHost = el('div');
-
-  /* Flush anything the previous instance still had pending, then stop its
-     timers. saveNow() runs its synchronous guard before the first await, so
-     destroying immediately afterwards does not cancel the request. */
-  if (liveEditor) {
-    if (liveEditor.dirty) liveEditor.saveNow();
-    liveEditor.destroy();
-    liveEditor = null;
-  }
-
-  let selected = params.model || state.scratch.schemaModel || firstModel();
-
-  const modelList = el('div.scroll-list');
-  const search = el('input.input', {
-    type: 'search',
-    placeholder: 'Filter models…',
-    'aria-label': 'Filter the model list',
-  });
-
-  search.addEventListener('input', () => {
-    const needle = search.value.trim().toLowerCase();
-    for (const button of modelList.querySelectorAll('.list-btn')) {
-      button.hidden = Boolean(needle) && !button.dataset.name.includes(needle);
-    }
-  });
-
-  /* ------------------------------------------------------------ picker --- */
-
-  function paintList() {
-    clear(modelList);
-
-    /* Out-of-scope models are omitted entirely rather than shown disabled.
-       In the generator they are listed so you can see why something is
-       missing, but here there is nothing to offer: the file cannot be opened
-       and there is no partial action to take. */
-    const usable = (state.models || []).filter((model) => model.in_scope !== false);
-
-    if (!usable.length) {
-      modelList.append(
-        el('p.small.faint', { style: { padding: '10px' } },
-          'No models are inside the permitted dataset scope.'),
-      );
-      return;
-    }
-
-    for (const model of usable) {
-      const complete = model.column_count > 0
-        && model.documented_columns === model.column_count;
-      modelList.append(
-        el(
-          'button',
-          {
-            class: `list-btn${model.name === selected ? ' sel' : ''}`,
-            dataset: { name: model.name.toLowerCase() },
-            title: model.name,
-            onclick: () => switchTo(model.name),
-          },
-          layerChip(model.layer),
-          el('span.lb-name', model.name),
-          el(
-            'span.lb-meta',
-            model.column_count
-              ? el(`span.chip.${complete ? 'ok' : 'warn'}`,
-                   `${model.documented_columns}/${model.column_count}`)
-              : el('span.chip', 'no columns'),
-          ),
-        ),
-      );
-    }
-  }
-
-  function switchTo(name) {
-    if (name === selected) return;
-
-    /* Never lose an edit to a stray click in the list. Offer to save it
-       rather than just refusing to move. */
-    if (liveEditor?.dirty) {
-      const ok = window.confirm(
-        `You have unsaved changes to ${selected}.\n\n` +
-        'OK to save them and open ' + name + '.\n' +
-        'Cancel to stay here.',
-      );
-      if (!ok) return;
-      liveEditor.saveNow();
-    }
-
-    selected = name;
-    state.scratch.schemaModel = name;
-    paintList();
-    open();
-  }
-
-  /* ------------------------------------------------------------ export --- */
-
-  const FORMATS = [
-    { key: 'yml', label: 'YAML', ext: 'yml', mime: 'text/yaml' },
-    { key: 'json', label: 'JSON', ext: 'json', mime: 'application/json' },
-    { key: 'markdown', label: 'Markdown', ext: 'md', mime: 'text/markdown' },
-  ];
-
-  async function doExport(format) {
-    /* Flush first, so a download can never hand someone a file that is missing
-       the sentence they just typed. */
-    if (liveEditor?.dirty) await liveEditor.saveNow();
-
-    try {
-      const payload = await api.exportDocs(selected);
-      const raw = payload[format.key];
-      const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
-      download(`${selected}.${format.ext}`, text, format.mime);
-      toast(`Downloaded ${selected}.${format.ext}`, { kind: 'ok' });
-    } catch (error) {
-      toast('Could not export', { kind: 'err', detail: error.message });
-    }
-  }
-
-  function paintExport() {
-    clear(exportHost).append(
-      el(
-        'div.row',
-        { style: { gap: '6px' } },
-        el('span.tiny.faint', { style: { alignSelf: 'center' } }, 'Download'),
-        ...FORMATS.map((format) =>
-          el('button.btn.btn-tiny', { onclick: () => doExport(format) }, format.label)),
-      ),
-    );
-  }
-
-  /* -------------------------------------------------------------- open --- */
-
-  function open() {
-    if (liveEditor) {
-      liveEditor.destroy();
-      liveEditor = null;
-    }
-    clear(statusHost);
-    clear(exportHost);
-
-    if (!selected) {
-      clear(editorHost).append(
-        el('div.panel', emptyState(
-          'Pick a model to edit',
-          'Choose one from the list. Its committed descriptions open ready to change.',
-        )),
-      );
-      return;
-    }
-
-    const instance = documentationEditor({
-      model: selected,
-      onSaved: (result) => {
-        /* The manifest was invalidated server-side, so the cached counts in the
-           list are now stale. Refresh them quietly rather than forcing a reload. */
-        refreshCounts();
-        if (result?.applied?.length) {
-          toast(
-            `Saved ${result.applied.length} description` +
-              `${result.applied.length === 1 ? '' : 's'}`,
-            { kind: 'ok', detail: result.path },
-          );
-        }
-      },
-    });
-
-    liveEditor = instance;
-    statusHost.append(instance.statusNode);
-    paintExport();
-
-    clear(editorHost).append(
-      el(
-        'div.panel',
-        el(
-          'div.panel-head',
-          el('h3', selected),
-          el('div.row', { style: { gap: '10px', marginLeft: 'auto' } }, statusHost, exportHost),
-        ),
-        instance.node,
-      ),
-    );
-  }
-
-  /* The counts on the left come from the models list, which is built from the
-     manifest. After a save the manifest is stale until dbt parses again, so
-     patch the numbers locally from what we know rather than lying. */
-  async function refreshCounts() {
-    try {
-      const payload = await api.editableDocs(selected);
-      const model = (state.models || []).find((m) => m.name === selected);
-      if (model) {
-        model.documented_columns = payload.documented;
-        model.column_count = payload.column_count;
-        model.has_description = payload.model_has_description;
-        paintList();
-      }
-    } catch {
-      /* A failed count refresh is cosmetic; the editor itself already
-         reported anything that actually went wrong. */
-    }
-  }
-
-  /* ---------------------------------------------------------- assemble --- */
-
-  paintList();
-
-  host.append(
-    el(
-      'div.row.between.mb',
-      el(
-        'div.row',
-        { style: { gap: '9px' } },
-        el('span.chip.info', 'Edit'),
-        el('span.small.faint',
-          'Editing the descriptions committed in this project\'s schema YAML files'),
-      ),
-      el(
-        'button.btn.btn-tiny',
-        {
-          onclick: () => {
-            if (liveEditor?.dirty) {
-              const ok = window.confirm(
-                'You have unsaved changes.\n\nOK to save them and leave.\nCancel to stay.',
-              );
-              if (!ok) return;
-              liveEditor.saveNow();
-            }
-            chosenEngine = null;
-            navigate('schema');
-          },
-        },
-        '← Switch mode',
-      ),
-    ),
-    el(
-      'div.split',
-      el(
-        'div.panel',
-        el('div.panel-head', el('h3', 'Models')),
-        el('div.panel-body', el('div.mb', search), modelList),
-      ),
-      editorHost,
-    ),
-  );
-
-  open();
-
-  return host;
-}
-
-/* ----------------------------------------------------------- yaml panel --- */
-
-function yamlPanel(payload, navigate) {
-  const pathInput = el('input.input', {
-    value: payload.suggested_path || `models/_${payload.name}.yml`,
-  });
-  const status = el('div');
-
-  async function write(mode) {
-    const path = pathInput.value.trim();
-    if (!path) {
-      toast('Give the file a path.', { kind: 'warn' });
-      return;
-    }
-
-    clear(status).append(loading(`Writing ${path}…`));
-    try {
-      const result = await api.writeFile(path, payload.yaml, mode);
-      clear(status).append(
-        callout(
-          `Wrote ${result.written}`,
-          [
-            `${num(result.bytes)} bytes`,
-            result.backup ? `previous version saved as ${result.backup}` : null,
-            result.note,
-          ]
-            .filter(Boolean)
-            .join(' · '),
-          'ok',
-          el(
-            'button.btn.btn-tiny.mt',
-            { onclick: () => navigate('runs', { autorun: 'parse' }) },
-            '⟳ Refresh manifest now',
-          ),
-        ),
-      );
-      toast(`Wrote ${result.written}`, { kind: 'ok' });
-    } catch (error) {
-      clear(status).append(
-        callout('Write failed', error.message, 'err',
-          error.detail ? el('pre.code-block', error.detail) : null),
-      );
-    }
-  }
-
-  return el(
-    'div.panel-body',
-    callout(
-      'Review before committing',
-      payload.engine === 'ai'
-        ? 'A language model wrote these descriptions from your schema and profile. It is usually right and occasionally confidently wrong, so read them. Overwriting an existing file keeps a .bak copy.'
-        : 'Descriptions are drafted from rules, not authoritative. Overwriting an existing file keeps a .bak copy next to it.',
-      'warn',
-    ),
-    el(
-      'div.row.wrap.mt.mb',
-      { style: { gap: '7px' } },
-      el('button.btn.btn-tiny', { onclick: () => copy(payload.yaml, 'YAML copied') }, '⧉ Copy'),
-      el(
-        'button.btn.btn-tiny',
-        { onclick: () => download(`${payload.name}.yml`, payload.yaml, 'text/yaml') },
-        '↓ Download',
-      ),
-    ),
-    codeBlock(payload.yaml, { language: 'yaml', tall: true }),
-    el(
-      'div.mt',
-      el('div.stat-label.mb', 'Write into the project'),
-      el(
-        'div.row.wrap',
-        { style: { gap: '7px' } },
-        pathInput,
-        el('button.btn', { onclick: () => write('overwrite') }, '⤓ Overwrite'),
-        el('button.btn', { onclick: () => write('append') }, '+ Append'),
-      ),
-      el('div.mt', status),
-    ),
-  );
 }
 
 /* ---------------------------------------------------------------- utils --- */
@@ -1189,17 +765,48 @@ function yamlPanel(payload, navigate) {
 function checkbox(label, checked, hint) {
   const input = el('input', { type: 'checkbox' });
   input.checked = checked;
-  const node = el(
-    'div',
+  const node = el('div',
     el('label.switch', input, el('span', label)),
-    hint ? el('p.tiny.faint', { style: { margin: '2px 0 0 22px', lineHeight: '1.45' } }, hint) : null,
-  );
+    hint ? el('p.tiny.faint', { style: { margin: '2px 0 0 22px', lineHeight: '1.45' } }, hint) : null);
   return { node, get checked() { return input.checked; } };
 }
 
+/**
+ * The documentation as CSV, RFC 4180 quoted so a comma in a description cannot
+ * shift the columns.
+ */
+function documentationCsv(modelName, columns) {
+  const cell = (value) => {
+    const text = String(value ?? '');
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  };
+  const lines = [['model', 'column', 'data_type', 'description'].join(',')];
+  for (const column of columns) {
+    lines.push([cell(modelName), cell(column.name),
+      cell(String(column.data_type || '').toLowerCase()), cell(column.description || '')].join(','));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/* The "arrow into a tray" download glyph. */
+function downloadIconSvg() {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '15'); svg.setAttribute('height', '15');
+  svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2.2');
+  svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+  const a = document.createElementNS(NS, 'path');
+  a.setAttribute('d', 'M12 3v11m0 0l-4-4m4 4l4-4');
+  const t = document.createElementNS(NS, 'path');
+  t.setAttribute('d', 'M5 15v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3');
+  svg.append(a, t);
+  return svg;
+}
+
 function firstModel() {
-  // Only ever preselect something the UI is permitted to read, otherwise the
-  // page opens on an immediate scope refusal.
   const usable = (state.models || []).filter((model) => model.in_scope !== false);
   const bronze = usable.find((model) => model.layer === 'bronze');
   return bronze?.name || usable[0]?.name || '';

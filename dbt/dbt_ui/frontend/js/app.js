@@ -8,6 +8,7 @@ import {
 import { callout, emptyState, loading } from './components.js';
 import { watchActive, watchJob } from './jobs.js';
 import * as prefs from './prefs.js';
+import { renderLogin } from './login.js';
 import { wireDrawer } from './views/drawer.js';
 
 import * as overview from './views/overview.js';
@@ -19,22 +20,55 @@ import * as runs from './views/runs.js';
 import * as catalog from './views/catalog.js';
 import * as erd from './views/erd.js';
 import * as schedule from './views/schedule.js';
+import * as settings from './views/settings.js';
 
-const VIEWS = { overview, pipeline, workbench, schema, advisor, runs, catalog, erd, schedule };
+const VIEWS = { overview, pipeline, workbench, schema, advisor, runs, catalog,
+                erd, schedule, settings };
 const ORDER = ['overview', 'pipeline', 'workbench', 'schema', 'advisor', 'runs',
-               'catalog', 'erd', 'schedule'];
+               'catalog', 'erd', 'schedule', 'settings'];
 
 let current = 'overview';
 
 /* ------------------------------------------------------------------ boot --- */
 
 async function boot() {
+  /* Appearance and help mode before the first paint, so there is no flash of
+     the wrong theme. Done before the auth check so the login screen is themed
+     too. */
+  prefs.init();
+
+  /* Authentication gate. Nothing else is set up until we know who this is,
+     because every other call would 401 anyway. */
+  let session;
+  try {
+    session = await api.session();
+  } catch (error) {
+    document.body.innerHTML = '';
+    document.body.append(
+      el('div.login-shell',
+        el('div.login-card',
+          callout('Cannot reach the dbt Studio backend', error.message, 'err',
+            el('pre.code-block',
+               error.detail || 'Restart the server:\n  python dbt_ui/serve.py')))),
+    );
+    return;
+  }
+
+  if (!session.authenticated) {
+    /* renderLogin re-enters boot() on success rather than reloading, so the
+       page does not flash and any deep link in the hash survives. */
+    renderLogin(() => {
+      /* Rebuild the shell markup the login screen replaced. */
+      document.location.reload();
+    });
+    return;
+  }
+
+  state.user = session.user;
+  state.permissions = session.permissions || {};
+
   const main = $('#main');
   clear(main).append(loading('Reading the dbt project…'));
-
-  /* Appearance and help mode before the first paint, so there is no flash of
-     the wrong theme. */
-  prefs.init();
 
   wireDrawer(navigate);
   wireHeader();
@@ -66,10 +100,16 @@ async function boot() {
   state.activeJob = state.boot.active_job;
   state.docsAvailable = state.boot.docs_available;
   state.scope = state.boot.scope;
+  /* Bootstrap is authoritative for identity and permissions - it is the fresher
+     read, and it reflects a role change made since the session started. */
+  state.user = state.boot.user || state.user;
+  state.permissions = state.boot.permissions || state.permissions;
+  state.roles = state.boot.roles || state.roles;
 
   paintBrand();
   paintTargets();
   paintLegend();
+  paintIdentity();
 
   if (state.boot.manifest_error) {
     toast(state.boot.manifest_error, { kind: 'warn', timeout: 9000 });
@@ -172,7 +212,11 @@ function paintBrand() {
 }
 
 function paintTargets() {
+  /* The environment selector was removed from the header. state.target is still
+     set from the profile's default_target at boot, so every query and build
+     keeps using it; there is just no in-header switcher to paint. */
   const select = $('#target-select');
+  if (!select) return;
   clear(select);
 
   for (const target of state.boot.targets) {
@@ -301,6 +345,50 @@ function paintMismatchPill() {
     : 'Chooses which BigQuery environment every query and build uses.';
 }
 
+/**
+ * Who is signed in, what role they hold, and a way out.
+ *
+ * The role is shown at all times rather than buried in a settings screen: when
+ * an action is missing, the first useful question is "what am I signed in as",
+ * and that should never require hunting.
+ */
+function paintIdentity() {
+  const host = $('#identity-box');
+  if (!host) return;
+
+  const user = state.user;
+  if (!user) {
+    host.hidden = true;
+    return;
+  }
+
+  const role = state.permissions?.label || user.role;
+  const readOnly = !state.permissions?.can_write_files;
+
+  clear(host).append(
+    el('div.identity',
+      el('div.identity-who',
+        el('span.identity-email', { title: user.email }, user.email),
+        el('span.row', { style: { gap: '5px', marginTop: '3px' } },
+          el(`span.chip.${role === 'Manager' ? 'ok' : 'info'}`, role),
+          readOnly ? el('span.chip.tiny', { title: 'This role cannot modify anything' }, 'read-only') : null)),
+      el('button.btn.btn-tiny.btn-ghost',
+        {
+          title: `Sign out of ${user.email}`,
+          onclick: async () => {
+            try {
+              await api.logout();
+            } catch {
+              /* Even if the call fails, get them off the screen. */
+            }
+            document.location.reload();
+          },
+        },
+        'Sign out')),
+  );
+  host.hidden = false;
+}
+
 /** The dataset allowlist, always visible so the boundary is never a surprise. */
 function paintScope() {
   const box = $('#scope-box');
@@ -366,18 +454,10 @@ function wireHeader() {
 }
 
 function wireKeyboard() {
-  document.addEventListener('keydown', (event) => {
-    /* Never hijack typing. */
-    const tag = document.activeElement?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
-
-    const index = Number(event.key);
-    if (Number.isInteger(index) && index >= 1 && index <= ORDER.length) {
-      event.preventDefault();
-      navigate(ORDER[index - 1]);
-    }
-  });
+  /* Number-key tab navigation was removed: it fired while typing in the SQL
+     editor and the contenteditable description cells (which are not INPUT or
+     TEXTAREA, so the old guard missed them), pulling the user off the page
+     mid-keystroke. Navigation is by clicking the sidebar. */
 }
 
 /* ------------------------------------------------------------ connection --- */

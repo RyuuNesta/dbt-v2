@@ -74,12 +74,13 @@ export function render(navigate, params = {}) {
   const picker = tablePicker({
     storageKey: 'advisor',
     title: 'Tables to analyse',
-    /* Only what this page can actually act on: a dbt-managed relation in a
-       layer that has a silver step ahead of it. Generating a silver model needs
-       a ref() target, which a foreign table does not have. */
-    rowFilter: (table) => table.managed_by_dbt
-      && ANALYSABLE_LAYERS.includes(table.layer)
-      && !table.is_view,
+    /* Show every in-scope physical table so any one can be ticked, not just the
+       dbt-managed bronze/silver ones. Analysis still needs a ref() target, so a
+       foreign table (no dbt model) is listed but flagged, and analyseSelection
+       skips it with a clear message rather than silently dropping it. Views are
+       included too - profiling a view is valid, it just reads the underlying
+       tables. */
+    rowFilter: () => true,
     onChange: (rows) => {
       paintAnalyseButton(rows);
       if (!deepLinkResolved) resolveDeepLink();
@@ -127,34 +128,68 @@ export function render(navigate, params = {}) {
   /* ------------------------------------------------------------ analyse --- */
 
   async function analyseSelection() {
-    const chosen = picker.selected().filter((row) => row.model);
+    const chosen = picker.selected();
 
     if (!chosen.length) {
       toast('Tick at least one table to analyse.', { kind: 'warn' });
       return;
     }
 
+    /* A table dbt builds carries a model name; a pre-existing ("foreign") one
+       does not. Both are analysed and both can generate a silver model - the
+       only difference is that a foreign table is read by its full relation name
+       instead of ref(), which the generated SQL notes. */
+    const foreign = chosen.filter((row) => !row.model);
+    if (foreign.length) {
+      toast(
+        `${foreign.length} of the selected table${foreign.length === 1 ? ' is' : 's are'} not built by dbt.`,
+        {
+          kind: 'info',
+          detail: 'They are analysed and can still generate a silver model; it '
+            + 'reads the table by its full name instead of ref(), with a note on '
+            + 'how to promote it to a dbt source.',
+        },
+      );
+    }
+
     const token = ++runToken;
     running = true;
     sessions.clear();
-    state.scratch.advisorModel = chosen.length === 1 ? chosen[0].model : '';
+    state.scratch.advisorModel = chosen.length === 1 ? (chosen[0].model || '') : '';
     paintAnalyseButton(chosen);
 
+    /* A stable, unique key for every table, model or not. */
+    const keyOf = (row) => row.model || row.qualified;
+    const nameOf = (row) => row.model || row.qualified;
+
     clear(output);
-    paintProgress(0, chosen.length, chosen[0].model);
+    paintProgress(0, chosen.length, nameOf(chosen[0]));
 
     for (let index = 0; index < chosen.length; index += 1) {
       /* A newer batch has started; abandon this one rather than interleaving. */
       if (token !== runToken) return;
 
       const row = chosen[index];
-      paintProgress(index, chosen.length, row.model);
+      paintProgress(index, chosen.length, nameOf(row));
 
-      const session = { model: row.model, row, analysis: null, accepted: new Set(), error: null };
-      sessions.set(row.model, session);
+      const session = {
+        key: keyOf(row),
+        model: row.model || null,
+        name: nameOf(row),
+        foreign: !row.model,
+        row,
+        analysis: null,
+        accepted: new Set(),
+        error: null,
+      };
+      sessions.set(session.key, session);
 
       try {
-        const analysis = await api.analyse({ model: row.model });
+        /* dbt table -> resolve by model name; foreign table -> by its physical
+           relation. The backend accepts either. */
+        const analysis = await api.analyse(
+          row.model ? { model: row.model } : { relation: row.relation },
+        );
         if (token !== runToken) return;
         session.analysis = analysis;
         for (const rec of analysis.recommendations || []) {
@@ -183,7 +218,7 @@ export function render(navigate, params = {}) {
         {
           kind: failed.length ? 'warn' : 'ok',
           detail: failed.length
-            ? `Could not profile: ${failed.map((s) => s.model).join(', ')}.`
+            ? `Could not profile: ${failed.map((s) => s.name).join(', ')}.`
             : '',
         },
       );
@@ -235,7 +270,7 @@ export function render(navigate, params = {}) {
       el(
         'div.panel-head',
         el('h3', 'Choose what to clean'),
-        el('span.small.faint', 'bronze and silver only'),
+        el('span.small.faint', 'any accessible table'),
       ),
       el(
         'div.panel-body',
@@ -275,7 +310,7 @@ export function render(navigate, params = {}) {
 
   function paintOutput(nav, all, chosen) {
     const list = chosen
-      .map((row) => all.get(row.model))
+      .map((row) => all.get(row.model || row.qualified))
       .filter(Boolean);
 
     if (!list.length) return;
@@ -312,7 +347,8 @@ export function render(navigate, params = {}) {
     const detailHost = el('div.mt');
 
     for (const session of list) {
-      const { model, analysis, error } = session;
+      const { analysis, error } = session;
+      const label = session.name;
 
       const open = () => {
         clear(detailHost).append(deepDive(nav, session, { standalone: false }));
@@ -332,7 +368,8 @@ export function render(navigate, params = {}) {
                 style: { fontFamily: 'var(--mono)' },
                 onclick: open,
               },
-              model,
+              label,
+              session.foreign ? el('span.chip.tiny', { style: { marginLeft: '6px' } }, 'foreign') : null,
             ),
           ),
           el('td.num', analysis ? num(analysis.profile.row_count) : '—'),
@@ -451,21 +488,25 @@ export function render(navigate, params = {}) {
         el(
           'div.panel-body',
           callout(
-            `Could not analyse ${session.model}`,
+            `Could not analyse ${session.name}`,
             session.error.message,
             'err',
             el(
               'div',
               session.error.detail ? el('pre.code-block', session.error.detail) : null,
-              el(
-                'div.mt',
-                el('span.small.faint', 'A relation has to exist in the warehouse before it can be profiled. '),
-                el(
-                  'button.btn.btn-tiny',
-                  { onclick: () => nav('runs', { select: session.model, autorun: 'run' }) },
-                  `⚡ Build ${session.model}`,
-                ),
-              ),
+              /* Only a dbt model can be built from here; a foreign table already
+                 exists or the failure is a permission/scope issue. */
+              session.model
+                ? el(
+                    'div.mt',
+                    el('span.small.faint', 'A relation has to exist in the warehouse before it can be profiled. '),
+                    el(
+                      'button.btn.btn-tiny',
+                      { onclick: () => nav('runs', { select: session.model, autorun: 'run' }) },
+                      `⚡ Build ${session.model}`,
+                    ),
+                  )
+                : null,
             ),
           ),
         ),
@@ -473,10 +514,12 @@ export function render(navigate, params = {}) {
     }
 
     if (!session.analysis) {
-      return el('div.panel', loading(`Profiling ${session.model}…`));
+      return el('div.panel', loading(`Profiling ${session.name}…`));
     }
 
     const { analysis, accepted, model } = session;
+    const foreign = session.foreign;
+    const displayName = session.name;
 
     /* Built lazily so a big profile does not wait on codegen, and cached so
        flipping back to a tab does not re-request.
@@ -495,16 +538,21 @@ export function render(navigate, params = {}) {
       if (index === 3 && !built.has(3)) { built.add(3); buildSilver(); }
     }
 
-    view = tabs([
+    /* Both dbt-built and foreign tables get the full flow. The only difference
+       is how the generated model names its input: a dbt model is ref()'d, a
+       foreign table is read by its fully-qualified relation (with a note in the
+       SQL on how to promote it to a dbt source). */
+    const tabDefs = [
       { label: 'Recommendations', count: analysis.summary.total, render: () => recommendationsPanel() },
       { label: 'Profile', count: analysis.profile.columns.length, render: () => profilePanel(analysis.profile) },
       { label: 'How it will be built', render: () => el('div.panel-body', loading('Working out the plan…')) },
       { label: 'Generated silver model', render: () => el('div.panel-body', loading('Building the model…')) },
-    ], { onChange: onTab });
+    ];
+    view = tabs(tabDefs, { onChange: onTab });
 
     const node = el(
       'div',
-      standalone ? null : el('div.deep-dive-mark', el('span.small.faint', `Detail · ${model}`)),
+      standalone ? null : el('div.deep-dive-mark', el('span.small.faint', `Detail · ${displayName}`)),
       summaryPanel(),
       el('div.panel.mt', view.node),
     );
@@ -524,7 +572,9 @@ export function render(navigate, params = {}) {
         'div.panel',
         el(
           'div.panel-head',
-          el('h3', `${model} → ${analysis.suggested_model_name}`),
+          el('h3', foreign
+            ? displayName
+            : `${model} → ${analysis.suggested_model_name}`),
           el(
             'div.row',
             { style: { gap: '6px' } },
@@ -681,12 +731,20 @@ export function render(navigate, params = {}) {
       )));
     }
 
+    /* ----------------------------------------------- foreign-table note --- */
+
     /* --------------------------------------------------- build preview --- */
+
+    /* How the backend should resolve the source: by model for a dbt table, by
+       physical relation for a foreign one. Both endpoints accept either. */
+    function sourceRef() {
+      return model ? { model } : { relation: session.row.relation };
+    }
 
     async function buildPreview() {
       try {
         const payload = await api.previewSilver({
-          model,
+          ...sourceRef(),
           accepted_ids: [...accepted],
           materialized: 'view',
         });
@@ -866,7 +924,7 @@ export function render(navigate, params = {}) {
     async function buildSilver() {
       try {
         const payload = await api.generateSilver({
-          model,
+          ...sourceRef(),
           accepted_ids: [...accepted],
           materialized: 'view',
         });

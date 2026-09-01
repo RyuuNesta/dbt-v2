@@ -50,57 +50,54 @@
               data-help="Project health at a glance: what exists, what passed, what needs attention.">
         <span class="nav-ico" aria-hidden="true">◈</span>
         <span class="nav-text">Overview</span>
-        <kbd aria-hidden="true">1</kbd>
       </button>
       <button class="nav-item" data-view="pipeline"
               data-help="Your data flow drawn left to right, from raw to business-ready.">
         <span class="nav-ico" aria-hidden="true">⬡</span>
         <span class="nav-text">Pipeline</span>
-        <kbd aria-hidden="true">2</kbd>
       </button>
       <button class="nav-item" data-view="workbench"
               data-help="Write and run SQL. Explore the data without touching it.">
         <span class="nav-ico" aria-hidden="true">▶</span>
         <span class="nav-text">Workbench</span>
-        <kbd aria-hidden="true">3</kbd>
       </button>
       <button class="nav-item" data-view="schema"
               data-help="Describe your tables: column names, types and what each one means.">
         <span class="nav-ico" aria-hidden="true">☰</span>
         <span class="nav-text">Documentation</span>
-        <kbd aria-hidden="true">4</kbd>
       </button>
       <button class="nav-item" data-view="advisor"
               data-help="Measures your raw data and suggests how to clean it.">
         <span class="nav-ico" aria-hidden="true">✦</span>
         <span class="nav-text">Cleanup Advisor</span>
-        <kbd aria-hidden="true">5</kbd>
       </button>
       <button class="nav-item" data-view="runs"
               data-help="Rebuild your tables and watch the progress live.">
         <span class="nav-ico" aria-hidden="true">⚡</span>
         <span class="nav-text">Build &amp; Test</span>
-        <kbd aria-hidden="true">6</kbd>
       </button>
       <button class="nav-item" data-view="catalog"
               data-help="Search everything and see how tables connect to each other.">
         <span class="nav-ico" aria-hidden="true">⌗</span>
         <span class="nav-text">Catalog</span>
-        <kbd aria-hidden="true">7</kbd>
       </button>
       <button class="nav-item" data-view="erd"
               title="Entity relationship diagram"
               data-help="A diagram of how your tables join, detected from tests, ref() calls and column naming.">
         <span class="nav-ico" aria-hidden="true">⛓</span>
         <span class="nav-text">ERD</span>
-        <kbd aria-hidden="true">8</kbd>
       </button>
       <button class="nav-item" data-view="schedule"
               title="Run dbt unattended on a timer"
               data-help="Rebuild on a timer without opening this app. Uses the Windows Task Scheduler.">
         <span class="nav-ico" aria-hidden="true">◷</span>
         <span class="nav-text">Schedules</span>
-        <kbd aria-hidden="true">9</kbd>
+      </button>
+      <button class="nav-item" data-view="settings"
+              title="Dataset access and role"
+              data-help="Choose which BigQuery datasets this UI may use, and which role is active.">
+        <span class="nav-ico" aria-hidden="true">⚙</span>
+        <span class="nav-text">Settings</span>
       </button>
     </nav>
 
@@ -112,6 +109,7 @@
       </div>
       <a class="ghost-link" href="/dbt-docs" target="_blank" rel="noopener"
          id="docs-link">dbt docs ↗</a>
+      <div class="identity-box" id="identity-box" hidden></div>
     </div>
   </aside>
 
@@ -125,15 +123,6 @@
       </div>
 
       <div class="topbar-right">
-        <div class="field-inline">
-          <label for="target-select">Environment</label>
-          <select id="target-select" class="select"
-                  aria-describedby="target-help"></select>
-          <span id="target-help" class="sr-only">
-            Chooses which BigQuery environment every query and build uses.
-          </span>
-        </div>
-
         <button class="btn btn-ghost" id="btn-refresh-manifest">
           <span aria-hidden="true">⟳</span>
           <span class="btn-label">Reload project</span>
